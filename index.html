@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PaperReaper · 作业终结者</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">P</div>
+    <div class="brand-text">
+      <h1>PaperReaper</h1>
+      <p>作业终结者 · 识图 · 解题 · 落笔</p>
+    </div>
+  </div>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="solve">主界面</button>
+    <button class="tab" data-tab="settings">设置配置</button>
+  </nav>
+
+  <div class="status-chip" id="statusChip" title="点击进入设置">
+    <span class="dot"></span><span id="statusText">未配置 API</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- ============ 主界面 ============ -->
+  <section class="view active" id="view-solve">
+
+    <!-- 顶部控制条 -->
+    <div class="controlbar">
+      <div class="ctl">
+        <span class="ctl-name">字号</span>
+        <input type="range" id="sizeRange" min="80" max="150" step="5" value="120">
+        <span class="slider-num" id="sizeNum">120%</span>
+      </div>
+      <div class="ctl">
+        <span class="ctl-name">涂改</span>
+        <input type="range" id="corRange" min="0" max="80" step="5" value="35">
+        <span class="slider-num" id="corNum">35%</span>
+      </div>
+      <div class="ctl">
+        <span class="ctl-name">正确率</span>
+        <input type="range" id="accRange" min="60" max="100" step="1" value="95">
+        <span class="slider-num" id="accNum">95%</span>
+      </div>
+      <div class="ctl ink-ctl">
+        <span class="ctl-name">墨色</span>
+        <div class="ink-swatches" id="inkSwatches">
+          <button data-ink="heavy" style="--c:#0d0d0d" title="浓黑"></button>
+          <button data-ink="normal" class="active" style="--c:#1c1c1c" title="标准黑"></button>
+          <button data-ink="light" style="--c:#3b3b3b" title="淡墨"></button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 三栏 -->
+    <div class="workspace">
+
+      <!-- 左栏 -->
+      <aside class="rail rail-left">
+        <div class="rail-head">作答要求</div>
+        <textarea id="reqInput" class="area slim" spellcheck="false" placeholder="例如：只做第1-3题；选择题只写选项字母；解答题写完整过程；字大一点。"></textarea>
+        <div class="row tight">
+          <button class="btn tiny primary" id="btnApplyReq">套用要求</button>
+          <button class="btn tiny ghost" id="btnClearReq">清空</button>
+        </div>
+        <p class="req-preview" id="reqPreview">还没有作答要求</p>
+      </aside>
+
+      <!-- 中栏：成果 -->
+      <section class="board">
+        <div class="board-head">
+          <div class="seg mini" id="viewSeg">
+            <button data-view="origin" class="active">原图</button>
+            <button data-view="result">作答图</button>
+            <button data-view="calib" disabled>校准图</button>
+          </div>
+          <span class="meta" id="stageMeta">等待上传图片</span>
+        </div>
+
+        <div class="canvas-wrap" id="canvasWrap">
+          <div class="dropzone" id="dropzone">
+            <div class="dz-frame">
+              <div class="dz-corner tl"></div><div class="dz-corner tr"></div>
+              <div class="dz-corner bl"></div><div class="dz-corner br"></div>
+              <div class="dz-icon">
+                <svg viewBox="0 0 48 48" width="44" height="44" aria-hidden="true">
+                  <path d="M8 12h32v26H8z" fill="none" stroke="currentColor" stroke-width="2.5"/>
+                  <path d="M8 20h32M17 12v8M31 12v8" fill="none" stroke="currentColor" stroke-width="2.5"/>
+                  <path d="M15 30h9M15 35h18M29 28l4 4 6-7" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="square"/>
+                </svg>
+              </div>
+              <h3>把试卷图片拖进来</h3>
+              <p>点击选择文件，或直接按 Ctrl + V 粘贴截图<br>支持多页图片</p>
+              <button class="btn primary" id="btnUpload">选择图片</button>
+              <input type="file" id="fileInput" accept="image/*" multiple hidden>
+            </div>
+          </div>
+
+          <div class="canvas-inner" id="canvasInner" hidden>
+            <img id="pageImg" alt="试卷页面">
+            <div class="box-layer" id="boxLayer"></div>
+            <div class="busy-mask" id="busyMask" hidden>
+              <div class="busy-box">
+                <div class="busy-bar"><i></i></div>
+                <p id="busyText">正在处理…</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 右栏 -->
+      <aside class="rail rail-right">
+        <div class="rail-head">生成</div>
+        <div class="seg" id="outputSeg">
+          <button class="active" data-output="agent">智能体</button>
+          <button data-output="precise">精准落位</button>
+        </div>
+        <p class="hint" id="outputHint">智能体：自动识题、解题、落笔并逐题自检。</p>
+
+        <div class="stack">
+          <button class="btn primary block" id="btnAuto">一键识图 + 落笔</button>
+          <button class="btn ghost block" id="btnAnalyze">仅识图分析</button>
+          <button class="btn accent block" id="btnSolve" disabled>重新生成作答图</button>
+          <button class="btn ghost block" id="btnAgentStop" hidden>中止运行</button>
+        </div>
+        <p class="hint" id="solveHint">上传图片后直接点「一键识图 + 落笔」；智能体模式无需先识图。</p>
+
+        <div class="rail-block">
+          <div class="rail-head">学习你的字体 <span class="badge" id="fontBadge" hidden>已学习</span></div>
+          <p class="hint">上传往期作答照片，学习墨色、字号与工整度；学习后覆盖上方设置。</p>
+          <div class="font-thumbs" id="fontThumbs"></div>
+          <div class="stack">
+            <button class="btn ghost block" id="btnLearnUpload">上传往期作答</button>
+            <button class="btn primary block" id="btnLearnApply" disabled>学习并应用</button>
+            <button class="btn ghost block danger" id="btnLearnClear" hidden>清除学习</button>
+          </div>
+          <p class="hint" id="fontNote"></p>
+          <input type="file" id="fontFileInput" accept="image/*" multiple hidden>
+        </div>
+
+        <div class="rail-block">
+          <div class="rail-head">笔迹细节</div>
+          <div class="slider-row">
+            <span class="slider-name">工整</span>
+            <input type="range" id="neatRange" min="0" max="100" step="5" value="35">
+            <span class="slider-num" id="neatNum">35%</span>
+          </div>
+        </div>
+
+        <div class="log" id="log"></div>
+      </aside>
+    </div>
+
+    <!-- 底部上传 -->
+    <div class="uploadbar">
+      <button class="btn primary" id="btnUploadBottom">选择图片</button>
+      <div class="page-strip" id="pageStrip"></div>
+      <button class="btn" id="btnExportImage" title="同时导出结果图和校准图" disabled>导出图片</button>
+      <button class="btn tiny danger" id="btnClear" disabled>清空</button>
+    </div>
+  </section>
+
+  <!-- ============ 设置配置 ============ -->
+  <section class="view" id="view-settings">
+    <div class="settings-wrap">
+      <div class="card">
+        <h2>模型密钥</h2>
+        <p class="hint">两套 Key 分开填：识图模型负责「看懂卷面」，解题模型负责「推理并调用落笔工具」。两个都走 OpenAI 兼容协议。</p>
+
+        <div class="key-card">
+          <div class="key-head">
+            <span class="key-no">1</span>
+            <b>识图模型 · Vision</b>
+            <span class="key-state" id="visionState">未配置</span>
+          </div>
+          <p class="hint">把试卷照片转成题目、答案行位置、括号与横线信息。推荐阿里云百炼 <code>qwen3-vl-plus</code>。</p>
+          <label class="field-label" for="visionBase">Base URL</label>
+          <input type="text" id="visionBase" class="input" spellcheck="false" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
+          <label class="field-label" for="visionModel">模型名</label>
+          <input type="text" id="visionModel" class="input" spellcheck="false" placeholder="qwen3-vl-plus">
+          <label class="field-label" for="visionKey">API Key</label>
+          <div class="key-row">
+            <input type="password" id="visionKey" class="input" placeholder="sk-..." autocomplete="off" spellcheck="false">
+            <button class="btn tiny" data-toggle-key="visionKey">显示</button>
+          </div>
+        </div>
+
+        <div class="key-card">
+          <div class="key-head">
+            <span class="key-no">2</span>
+            <b>解题模型 · LLM</b>
+            <span class="key-state" id="llmState">未配置</span>
+          </div>
+          <p class="hint">负责读题、推理、决定每个空写什么，并调度本地落笔工具。推荐 <code>deepseek-chat</code>；也可以直接复用识图模型。</p>
+          <label class="field-label" for="llmBase">Base URL</label>
+          <input type="text" id="llmBase" class="input" spellcheck="false" placeholder="https://api.deepseek.com/v1">
+          <label class="field-label" for="llmModel">模型名</label>
+          <input type="text" id="llmModel" class="input" spellcheck="false" placeholder="deepseek-chat">
+          <label class="field-label" for="llmKey">API Key</label>
+          <div class="key-row">
+            <input type="password" id="llmKey" class="input" placeholder="sk-..." autocomplete="off" spellcheck="false">
+            <button class="btn tiny" data-toggle-key="llmKey">显示</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <button class="btn primary" id="btnSave">保存</button>
+          <button class="btn ghost" id="btnTest">测试两个 Key</button>
+          <button class="btn ghost" id="btnClearKeys">清空 Key</button>
+        </div>
+        <p class="hint">Key 只保存在本机浏览器的 localStorage，不会写进项目文件；运行任务时通过本机 localhost 传给本地 Agent，用完即弃。</p>
+      </div>
+
+      <div class="card">
+        <h2>怎么用</h2>
+        <ol class="steps">
+          <li><b>填 Key。</b>在上方分别填入识图模型和解题模型的 Key，点「保存」。</li>
+          <li><b>传图。</b>主界面底部选择图片，或把图片拖进中间画布。</li>
+          <li><b>定要求（可选）。</b>左栏写「只做第 1-6 题」「选择题只写字母」，点「套用要求」。</li>
+          <li><b>生成。</b>点「一键识图 + 落笔」，智能体会自动识题、解题、落笔并逐题自检。</li>
+          <li><b>看结果。</b>中间切到「作答图」看成品，「校准图」看每一笔有没有落进括号或横线。</li>
+          <li><b>拿走。</b>底部「导出图片」，结果图和校准图一起下载。</li>
+        </ol>
+
+        <h2 class="mt">它怎么工作</h2>
+        <ul class="tips">
+          <li><b>识图：</b>视觉模型只做忠实转写，给出题号、题型和作答行位置，不碰像素坐标。</li>
+          <li><b>解题：</b>语言模型负责推理与答案，逐题决定写什么。</li>
+          <li><b>落笔：</b>本地引擎自己找括号/横线、缩放字号、贴线书写，再回检有没有横向出界。</li>
+          <li><b>验收：</b>只有每一题都 <code>ok:true</code> 才算通过；失败会自动按漂移修正并重试，仍失败就明确报出题号。</li>
+          <li><b>隐私：</b>试卷图片和 Key 只在本机流转；仓库里没有任何真实 Key。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script src="app.js?v=20261122e"></script>
+</body>
+</html>

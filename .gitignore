@@ -1,0 +1,32 @@
+# runtime output
+.agent_runs/
+out/
+render_error.log
+*.log
+
+# secrets
+.env
+engine/.env
+
+# fonts are not distributed (license)
+engine/fonts/*.ttf
+engine/fonts/*.otf
+engine/fonts/*.woff2
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# node
+node_modules/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# local archives
+*.zip
