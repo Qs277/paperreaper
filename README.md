@@ -19,11 +19,11 @@
 
 左边是原卷，右边是它自己写出来的答案：
 
-![before after](docs/before_after.jpg)
+![before after](docs/before-after-v2.jpg)
 
 放大看细节：分数是上下结构，`α≥3` 自动换成符号字体，长公式贴着横线向右延伸。
 
-![detail](docs/detail.jpg)
+![detail](docs/detail-v2.jpg)
 
 > 这不是「让 AI 重画一张图」。原卷的纸张、印刷文字、题号、版式一个像素都不改，只在预留的括号和横线里落笔。
 
@@ -160,7 +160,7 @@ node server.js
 
 验收只查横向：墨迹左右不得越出空档（±2px）；纵向允许超出括号，避免字号被括号高度压得很小。
 
-![calibration](docs/calibration.jpg)
+![calibration](docs/calibration-v2.jpg)
 
 ---
 
