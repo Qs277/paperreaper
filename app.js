@@ -94,6 +94,7 @@ const state = {
   style: 'kai',
   selectedQ: -1,
   inkTone: 'normal',
+  ansInk: 'normal',
   requirement: '',
   reqScale: 1,
   fontProfile: null,
@@ -103,6 +104,31 @@ const state = {
 
 function inkColor() {
   return (INK_TONES[state.inkTone] || INK_TONES.normal).color;
+}
+
+function hexToRgb(hex) {
+  const m = String(hex || '').replace('#', '').match(/^([0-9a-f]{6})$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+/* 把「字迹细节」和已学习的字迹档案翻译成引擎的风格指纹（整页统一，不逐字随机） */
+function styleProfile() {
+  const neat = clamp(Number(state.human.neatness) || 50, 0, 100);
+  const size = clamp(Number(state.human.size) || 100, 80, 150);
+  const tone = state.inkTone || 'normal';
+  const prof = {
+    x_height: clamp(0.96 + (size - 100) / 100 * 0.30, 0.93, 1.08),
+    spacing: clamp(0.95 + (neat - 50) / 100 * 0.10, 0.93, 1.07),
+    slant: clamp(0.02 + (neat - 55) / 100 * 0.07, -0.05, 0.10),
+    baseline: clamp(1.30 - neat / 100 * 0.60, 0.65, 1.35),
+    pressure: clamp(0.06 + (100 - neat) / 100 * 0.12, 0.06, 0.20),
+    stroke: tone === 'heavy' ? 1 : (tone === 'light' ? -1 : 0)
+  };
+  const rgb = hexToRgb(inkColor());
+  if (tone !== 'normal' && rgb) prof.ink = rgb;
+  return prof;
 }
 
 let pageSeq = 0;
@@ -120,6 +146,12 @@ function loadConfig() {
   state.llm.key = pick(saved?.llm?.key, DEFAULTS.llm.key);
   state.llm.base = pick(saved?.llm?.base, DEFAULTS.llm.base);
   state.llm.model = pick(saved?.llm?.model, DEFAULTS.llm.model);
+  if (/v4\.1/i.test(state.llm.model)) state.llm.model = DEFAULTS.llm.model;
+  // 识图恢复千问；若旧配置被改成了 DeepSeek，自动改回千问
+  if (/deepseek/i.test(state.vision.base + ' ' + state.vision.model)) {
+    state.vision.base = DEFAULTS.vision.base;
+    state.vision.model = DEFAULTS.vision.model;
+  }
   state.human.accuracy = Number.isFinite(saved?.accuracy) ? saved.accuracy : 95;
   state.human.correction = Number.isFinite(saved?.correction) ? saved.correction : 35;
   state.human.neatness = Number.isFinite(saved?.neatness) ? saved.neatness : 35;
@@ -333,19 +365,29 @@ function renderStage() {
   if (!p) {
     $('#stageMeta').textContent = '等待上传图片';
     $('#boxLayer').innerHTML = '';
+    if ($('#btnScanView')) $('#btnScanView').hidden = true;
+    if ($('#btnDocView')) $('#btnDocView').hidden = true;
     return;
   }
   const showingGrid = !!p.showGrid && !!p.gridUrl;
   const showingResult = !showingGrid && p.showResult && p.result;
   const showingCalib = !showingGrid && !showingResult && !!p.showCalib && !!p.calib;
+  const showingScan = !showingGrid && !showingResult && !showingCalib && !!p.showScan && !!p.agentScan;
   $('#pageImg').src = showingGrid
     ? p.gridUrl
-    : (showingResult ? p.result : (showingCalib ? p.calib : p.dataUrl));
-  $('#boxLayer').style.display = (showingGrid || showingResult || showingCalib) ? 'none' : 'block';
+    : (showingResult ? p.result
+      : (showingCalib ? p.calib : (showingScan ? p.agentScan : p.dataUrl)));
+  const editing = !!(p.agentLayout && showingResult);
+  $('#boxLayer').style.display = (showingGrid || showingCalib
+    || (showingResult && !editing)) ? 'none' : 'block';
   const view = showingGrid ? 'grid'
     : (showingResult ? 'result' : (showingCalib ? 'calib' : 'origin'));
   $$('#viewSeg button').forEach(b => b.classList.toggle('active', b.dataset.view === view));
-  $('#stageMeta').textContent = `第 ${state.active + 1} / ${state.pages.length} 页 · ${p.w}×${p.h}${p.analysis ? ' · 已识图' : ''}`;
+  const kind = showingScan ? ' · 扫描件' : (showingResult ? ' · 作答结果'
+    : (showingCalib ? ' · 校准图' : ''));
+  $('#stageMeta').textContent = `第 ${state.active + 1} / ${state.pages.length} 页 · ${p.w}×${p.h}${kind}${p.analysis ? ' · 已识图' : ''}`;
+  if ($('#btnScanView')) $('#btnScanView').hidden = !p.agentScan;
+  if ($('#btnDocView')) $('#btnDocView').hidden = !p.agentDoc;
   renderBoxes();
 }
 
@@ -941,9 +983,8 @@ async function prepareForApi(dataUrl, maxSide = 1600) {
   const h = img.naturalHeight;
   const mime = (dataUrl.match(/^data:([^;]+)/) || [])[1] || 'image/png';
   const scale = Math.min(1, maxSide / Math.max(w, h));
-  if (scale >= 1 && dataUrl.length < 4_000_000) {
-    return { dataUrl, base64: dataUrl.split(',')[1], mime, width: w, height: h };
-  }
+  // 一律过一遍 canvas：把浏览器已经转正的方向真正写进像素，
+  // 否则原图可能带着旋转元数据，后端 OpenCV 读到的是横着的。
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.round(w * scale));
   canvas.height = Math.max(1, Math.round(h * scale));
@@ -1086,6 +1127,10 @@ async function handleAnalyze() {
   if (!state.vision.key.trim()) {
     switchTab('settings');
     return toast('请先在设置里填写识图模型的 API Key', 'warn');
+  }
+  if (state.output === 'agent') {
+    await runAgentScan(page);
+    return;
   }
   try {
     await analyzePage(page);
@@ -1421,7 +1466,7 @@ function buildLocalCommands(items) {
 }
 
 async function renderWithLocalTool(page, items) {
-  const commands = { style: state.style, items: buildLocalCommands(items) };
+  const commands = { style: state.style, profile: styleProfile(), items: buildLocalCommands(items) };
   if (!commands.items.length) throw new Error('没有可落笔的答案');
   const image = await prepareForApi(page.dataUrl, 1700);
   let res;
@@ -1443,25 +1488,34 @@ async function renderWithLocalTool(page, items) {
 let agentAbort = null;
 let agentRunning = false;
 
-async function runAgentMode(page) {
+async function runAgentStage(page, stage, plan, extra) {
   if (agentRunning) return toast('智能体正在运行，请先中止或等待完成', 'warn');
-  if (!state.vision.key.trim() || !state.llm.key.trim()) {
+  if (stage !== 'compose' && (!state.vision.key.trim() || !state.llm.key.trim())) {
     switchTab('settings');
-    return toast('请先填好识图模型和解题模型的 Key', 'warn');
+    return toast('请先填好识图（千问）和解题（DeepSeek）两个 Key', 'warn');
   }
   agentRunning = true;
   const ctrl = new AbortController();
   agentAbort = ctrl;
   const stopBtn = $('#btnAgentStop');
   if (stopBtn) stopBtn.hidden = false;
-  setBusy(true, '智能体正在识题、解题、落笔…');
-  log('智能体启动：识题 → 解题 → 落笔 → 逐题自检');
+  setBusy(true, stage === 'scan' ? '智能体正在扫描定位…'
+    : (stage === 'compose' ? '正在按你调整的位置生成定稿…' : '智能体正在按确认位置作答…'));
+  log(stage === 'scan'
+    ? '第一轮：扫描定位 → 生成框选图，确认后再作答'
+    : (stage === 'compose'
+      ? '定稿：按你拖动/缩放后的位置重新落笔，不再调用模型'
+      : '第二轮：严格按确认的位置作答'));
 
   let doneEvt = null;
   try {
     const img = await prepareForApi(page.dataUrl, 1700);
     const req = String(state.requirement || '').trim();
-    const task = '识别并作答这张试卷，严格按 AGENTS.md 流程执行。'
+    const task = (stage === 'scan'
+      ? '只识别这张试卷并标出每一题的落笔区域，不要解题、不要落笔。'
+      : (stage === 'compose'
+        ? '按用户确认的布局定稿。'
+        : '严格按用户确认的框作答，不要重新寻找位置。'))
       + (req ? '\n用户作答要求：' + req : '');
 
     let res;
@@ -1473,6 +1527,11 @@ async function runAgentMode(page) {
           image: img.dataUrl,
           filename: page.name,
           task,
+          stage,
+          plan: plan || null,
+          layout: extra?.layout || null,
+          dir: extra?.dir || '',
+          profile: styleProfile(),
           keys: {
             vision: { ...state.vision },
             llm: { ...state.llm }
@@ -1515,16 +1574,93 @@ async function runAgentMode(page) {
     }
 
     if (!doneEvt) throw new Error('智能体连接中断，没有拿到结果');
-    if (!doneEvt.result) throw new Error('智能体没有产出作答图，请看上方日志里的题号');
-
-    page.result = doneEvt.result;
-    page.calib = doneEvt.calib || '';
-    page.showResult = true;
-    page.showCalib = false;
-    page.showGrid = false;
-    renderAll();
-    log('作答完成：结果图' + (doneEvt.calib ? ' + 校准图' : '（本次没有校准图）'), 'ok');
-    toast('作答图已生成', 'ok');
+    if (stage === 'scan') {
+      if (!doneEvt.plan) throw new Error('扫描没有返回位置计划');
+      page.agentPlan = doneEvt.plan;
+      page.agentPreview = doneEvt.preview || '';
+      page.agentScan = doneEvt.scan || '';
+      page.agentDoc = doneEvt.doc || '';
+      page.agentDir = doneEvt.dir || '';
+      page.agentLayout = null;
+      const planItems = doneEvt.plan.items || [];
+      page.analysis = {
+        page_type: 'agent_scan',
+        questions: planItems.map(it => {
+          const b = it.box || [(it.x ?? 0.6) - 0.03, (it.y ?? 0.5) - 0.012,
+                               (it.x ?? 0.6) + 0.03, (it.y ?? 0.5) + 0.012];
+          return {
+            index: it.q,
+            type: it.type === 'work' ? '解答' : (it.type === 'choice' ? '选择' : '填空'),
+            area: {
+              x: b[0], y: b[1],
+              w: Math.max(0.02, b[2] - b[0]),
+              h: Math.max(0.012, b[3] - b[1])
+            },
+            _checked: true
+          };
+        })
+      };
+      page.showScan = !!(page.agentScan || page.agentPreview);
+      page.result = null;
+      page.calib = '';
+      page.showResult = false;
+      page.showCalib = false;
+      page.showGrid = false;
+      state.selectedQ = -1;
+      renderAll();
+      if (page.agentPreview) log('框选图：' + page.agentPreview);
+      if (page.agentDoc) log('文档页：' + page.agentDoc);
+      if (doneEvt.dir) log('扫描件/文档目录：' + doneEvt.dir);
+      log('第一轮完成：可直接拖动/缩放框，确认后点“作答”', 'ok');
+      toast('第一轮完成，调整框选后点作答', 'ok');
+    } else if (stage === 'compose') {
+      if (!doneEvt.result) throw new Error('定稿没有产出图片');
+      page.result = doneEvt.result;
+      page.calib = doneEvt.calib || '';
+      page.agentLayout = null;
+      page.analysis = null;
+      page.showResult = true;
+      page.showScan = false;
+      page.showCalib = false;
+      page.showGrid = false;
+      renderAll();
+      if (page._ansRefresh) page._ansRefresh();
+      log('定稿完成，可直接导出：' + doneEvt.result, 'ok');
+      toast('定稿完成，可导出', 'ok');
+    } else {
+      if (!doneEvt.result) throw new Error('智能体没有产出作答图，请看上方日志里的题号');
+      page.result = doneEvt.result;
+      page.calib = doneEvt.calib || '';
+      page.agentDir = doneEvt.dir || '';
+      page.agentLayout = doneEvt.layout || null;
+      if (page.agentLayout && Array.isArray(page.agentLayout.items)) {
+        page.analysis = {
+          page_type: 'agent_layout',
+          questions: page.agentLayout.items.map(it => {
+            const b = it.box || [];
+            return {
+              index: it.q,
+              type: it.type === 'work' ? '解答' : (it.type === 'choice' ? '选择' : '填空'),
+              area: {
+                x: b[0] ?? 0.5, y: b[1] ?? 0.5,
+                w: Math.max(0.015, (b[2] ?? 0.55) - (b[0] ?? 0.5)),
+                h: Math.max(0.012, (b[3] ?? 0.52) - (b[1] ?? 0.5))
+              },
+              _checked: true
+            };
+          })
+        };
+      }
+      page.showScan = false;
+      page.showResult = true;
+      page.showCalib = false;
+      page.showGrid = false;
+      renderAll();
+      log('作答完成：结果图' + (doneEvt.calib ? ' + 校准图' : '（本次没有校准图）'), 'ok');
+      if (page.agentLayout) log('可以直接拖动/缩放框，调好后点「确认定稿」重新生成', 'ok');
+      toast(page.agentLayout ? '作答图已生成，可调位置后定稿' : '作答图已生成', 'ok');
+      if (page.agentLayout) openAnsEditor(page);
+    }
   } catch (e) {
     if (e.name === 'AbortError') {
       log('已中止智能体运行', 'warn');
@@ -1541,11 +1677,204 @@ async function runAgentMode(page) {
   }
 }
 
+async function runAgentScan(page) {
+  return runAgentStage(page, 'scan');
+}
+
+/* 把用户拖动/缩放后的框写回 plan，第二轮严格按它落笔 */
+function syncPlanFromBoxes(page) {
+  const items = page.agentPlan?.items || [];
+  const qs = page.analysis?.questions || [];
+  items.forEach((it, i) => {
+    const q = qs[i];
+    if (!q || !q.area) return;
+    const a = q.area;
+    it.box = [a.x, a.y, a.x + a.w, a.y + a.h];
+    it.skip = q._checked === false;
+    if ((it.type || '').toLowerCase() === 'work') {
+      it.x = a.x;
+      it.y = a.y;
+      it.w = a.w;
+      it.h = a.h;
+      it.area = { ...(it.area || {}), x: a.x, y: a.y, w: a.w, h: a.h };
+    } else {
+      it.y = a.y + a.h / 2;
+      it.x = a.x + a.w / 2;
+    }
+  });
+}
+
+async function runAgentRender(page) {
+  if (!page.agentPlan) return toast('请先点“分析/扫描定位”生成框选图并确认', 'warn');
+  syncPlanFromBoxes(page);
+  return runAgentStage(page, 'render', page.agentPlan);
+}
+
+/* 把用户拖动/缩放后的作答框写回布局，交给引擎脱机定稿 */
+function layoutFromBoxes(page) {
+  const layout = JSON.parse(JSON.stringify(page.agentLayout || {}));
+  const qs = page.analysis?.questions || [];
+  (layout.items || []).forEach((it, i) => {
+    const a = qs[i]?.area;
+    if (a) it.box = [a.x, a.y, a.x + a.w, a.y + a.h];
+  });
+  return layout;
+}
+
+async function handleCompose() {
+  const page = activePage();
+  if (!page || !page.agentLayout) {
+    return toast('先生成一版作答图，再调整位置', 'warn');
+  }
+  const layout = layoutFromBoxes(page);
+  return runAgentStage(page, 'compose', null, { layout, dir: page.agentDir || '' });
+}
+
+/* ---------------- 作答结果编辑器 ---------------- */
+let ansItems = [];
+
+function ansLabel(it) {
+  const t = String(it.type || '').toLowerCase();
+  if (t === 'work') return '过程';
+  if (t === 'fraction') return `${it.num ?? ''}/${it.den ?? ''}`;
+  return it.text || '答案';
+}
+
+function syncAnsLayer() {
+  const st = $('#ansStage'), im = $('#ansImg'), ly = $('#ansLayer');
+  if (!st || !im || !ly || !im.naturalWidth) return;
+  const r = im.getBoundingClientRect(), sr = st.getBoundingClientRect();
+  ly.style.left = (r.left - sr.left + st.scrollLeft) + 'px';
+  ly.style.top = (r.top - sr.top + st.scrollTop) + 'px';
+  ly.style.width = r.width + 'px';
+  ly.style.height = r.height + 'px';
+}
+
+function renderAnsBoxes() {
+  const ly = $('#ansLayer');
+  if (!ly) return;
+  ly.innerHTML = '';
+  ansItems.forEach((it, i) => {
+    const b = it.box || [0.5, 0.5, 0.55, 0.52];
+    const el = document.createElement('div');
+    el.className = 'ans-box';
+    el.style.left = (b[0] * 100) + '%';
+    el.style.top = (b[1] * 100) + '%';
+    el.style.width = Math.max(0.6, (b[2] - b[0]) * 100) + '%';
+    el.style.height = Math.max(0.6, (b[3] - b[1]) * 100) + '%';
+    el.innerHTML = `<span class="tag">${escapeHtml(ansLabel(it))}</span>`
+      + '<span class="grip"></span>';
+    el.addEventListener('pointerdown', ev => startAnsDrag(
+      ev, i, el, ev.target.classList.contains('grip') ? 'resize' : 'move'));
+    ly.appendChild(el);
+  });
+  const list = $('#ansList');
+  if (list) {
+    list.innerHTML = ansItems.map(it =>
+      `<div><span>第${escapeHtml(it.q)}题</span><b>${escapeHtml(ansLabel(it))}</b></div>`
+    ).join('') || '<div>暂无答案</div>';
+  }
+}
+
+function startAnsDrag(e, i, el, mode) {
+  e.preventDefault();
+  e.stopPropagation();
+  const ly = $('#ansLayer');
+  const rect = ly.getBoundingClientRect();
+  if (rect.width < 10 || rect.height < 10) return;
+  const start = [...(ansItems[i].box || [0.5, 0.5, 0.55, 0.52])];
+  const sx = e.clientX, sy = e.clientY;
+  try { el.setPointerCapture(e.pointerId); } catch { /* 老浏览器忽略 */ }
+  const onMove = ev => {
+    const r = ly.getBoundingClientRect();
+    if (r.width < 10 || r.height < 10) return;
+    // 用“起点 + 总位移”计算，避免逐帧累计带来的比例误差
+    const dx = (ev.clientX - sx) / r.width;
+    const dy = (ev.clientY - sy) / r.height;
+    const b = [...start];
+    if (mode === 'resize') {
+      b[2] = clamp(start[2] + dx, start[0] + 0.008, 1);
+      b[3] = clamp(start[3] + dy, start[1] + 0.006, 1);
+    } else {
+      const w = start[2] - start[0], h = start[3] - start[1];
+      b[0] = clamp(start[0] + dx, 0, 1 - w);
+      b[1] = clamp(start[1] + dy, 0, 1 - h);
+      b[2] = b[0] + w;
+      b[3] = b[1] + h;
+    }
+    const box = b.map(v => Math.round(v * 10000) / 10000);
+    ansItems[i].box = box;
+    // 拖拽过程中只改当前元素，不重建 DOM，保证和鼠标 1:1
+    el.style.left = (box[0] * 100) + '%';
+    el.style.top = (box[1] * 100) + '%';
+    el.style.width = Math.max(0.4, (box[2] - box[0]) * 100) + '%';
+    el.style.height = Math.max(0.4, (box[3] - box[1]) * 100) + '%';
+  };
+  const onUp = () => {
+    document.removeEventListener('pointermove', onMove);
+    document.removeEventListener('pointerup', onUp);
+    document.removeEventListener('pointercancel', onUp);
+    try { el.releasePointerCapture(e.pointerId); } catch { /* 忽略 */ }
+    renderAnsBoxes();
+  };
+  document.addEventListener('pointermove', onMove);
+  document.addEventListener('pointerup', onUp);
+  document.addEventListener('pointercancel', onUp);
+}
+
+function answerProfile() {
+  const neat = clamp(Number($('#ansSloppy')?.value ?? 35), 0, 100) / 100;
+  const inks = { heavy: [13, 13, 13], normal: [28, 28, 28], light: [59, 59, 59] };
+  return {
+    ink: inks[state.ansInk || 'normal'] || inks.normal,
+    spacing: 0.96 + neat * 0.10,
+    slant: 0.01 + neat * 0.09,
+    pressure: 0.05 + neat * 0.13,
+    baseline: 0.90 + neat * 0.45,
+    stroke: state.ansInk === 'heavy' ? 1 : (state.ansInk === 'light' ? -1 : 0)
+  };
+}
+
+function openAnsEditor(page) {
+  const ed = $('#ansEditor');
+  if (!ed) return toast('页面还是旧版，请 Ctrl+F5 强制刷新', 'warn');
+  if (!page || !page.result) return toast('先点「一键作答」生成结果', 'warn');
+  const items = page.agentLayout?.items;
+  ansItems = Array.isArray(items) ? JSON.parse(JSON.stringify(items)) : [];
+  // 默认沿用已学习的字迹风格，用户仍可在右侧改
+  const neat = clamp(Number(state.fontProfile?.neatness ?? state.human.neatness ?? 35), 0, 100);
+  if ($('#ansSloppy')) {
+    $('#ansSloppy').value = neat;
+    $('#ansSloppyNum').textContent = neat + '%';
+  }
+  state.ansInk = state.fontProfile?.tone || state.inkTone || 'normal';
+  $$('#ansInkSeg button').forEach(b =>
+    b.classList.toggle('active', b.dataset.ink === state.ansInk));
+  ed.hidden = false;
+  $('#ansMeta').textContent = ansItems.length
+    ? `${ansItems.length} 个答案 · 拖动框移动，拖右下角改大小`
+    : '可拖动调整';
+  const refresh = () => { syncAnsLayer(); renderAnsBoxes(); };
+  $('#ansImg').onload = refresh;
+  $('#ansImg').src = page.result;
+  page._ansRefresh = refresh;
+  setTimeout(refresh, 60);
+}
+
+async function composeFromEditor() {
+  const page = activePage();
+  if (!page || !page.agentLayout) return toast('还没有可定稿的作答结果', 'warn');
+  const base = JSON.parse(JSON.stringify(page.agentLayout));
+  base.items = JSON.parse(JSON.stringify(ansItems));
+  base.profile = answerProfile();
+  await runAgentStage(page, 'compose', null, { layout: base, dir: page.agentDir || '' });
+}
+
 async function handleSolve() {
   const page = activePage();
   if (!page) return toast('请先上传图片', 'warn');
   if (state.output === 'agent') {
-    await runAgentMode(page);
+    await runAgentRender(page);
     return;
   }
   if (!page.analysis) return toast('请先识图分析', 'warn');
@@ -1582,7 +1911,11 @@ async function handleAuto() {
   if (!page) return toast('请先上传图片', 'warn');
 
   if (state.output === 'agent') {
-    await runAgentMode(page);
+    if (!page.agentPlan) await runAgentStage(page, 'scan');
+    if (page.agentPlan) {
+      syncPlanFromBoxes(page);
+      await runAgentStage(page, 'render', page.agentPlan);
+    }
     return;
   }
 
@@ -1838,7 +2171,9 @@ function updateHint() {
   const solveHint = $('#solveHint');
   if (solveHint) {
     solveHint.textContent = state.output === 'agent'
-      ? '上传图片后直接点「一键识图 + 落笔」，全程自动；运行中可中止。'
+      ? (p?.agentPlan
+        ? '已扫描定位：核对框选图后点「作答」，将严格按确认位置落笔。'
+        : '第一轮点「识图分析」扫描定位并生成框选图，确认后点「作答」；也可点「一键」跑完两轮。')
       : (p?.analysis
         ? `将书写 ${targetQuestions(p).length} 题${state.requirement.trim() ? '，按左侧作答要求执行' : ''}。虚线框可拖动、可缩放。`
         : '上传图片后先识图，或直接点「一键识图 + 落笔」。');
@@ -1853,8 +2188,14 @@ function updateButtons() {
   bind('#btnSolve', !p || busy || (state.output !== 'agent' && !p.analysis));
   bind('#btnAuto', !p || busy);
   bind('#btnDownload', !p || !p.result);
+  bind('#btnAnsEdit', !p || !p.result);
   bind('#btnExportImage', !p || !p.result);
   bind('#btnDownloadAll', !state.pages.some(x => x.result) || busy);
+  const compEl = $('#btnCompose');
+  if (compEl) {
+    compEl.hidden = !(p && p.agentLayout);
+    compEl.disabled = busy;
+  }
   bind('#btnClear', !state.pages.length || busy);
   bind('#btnUpload', busy);
   bind('#btnUploadBottom', busy);
@@ -2418,6 +2759,32 @@ function bindEvents() {
     updateButtons();
   }));
 
+  // 扫描件 / 文档页查看
+  function openViewer(kind) {
+    const p = activePage();
+    const url = p && (kind === 'doc' ? p.agentDoc : p.agentScan);
+    if (!url) {
+      toast(kind === 'doc'
+        ? '这一页还没有文档页，先点「仅识图分析」'
+        : '这一页还没有扫描件，先点「仅识图分析」');
+      return;
+    }
+    $('#viewerTitle').textContent = kind === 'doc' ? '扫描文档' : '扫描件';
+    $('#scanImg').src = url;
+    $('#scanOpen').href = url;
+    $('#scanMeta').textContent = `第 ${state.active + 1} 页 · ${p.w}×${p.h} · 与扫描件同坐标`;
+    $('#scanModal').hidden = false;
+  }
+  on('#btnScanView', 'click', () => openViewer('scan'));
+  on('#btnDocView', 'click', () => openViewer('doc'));
+  on('#scanClose', 'click', () => { $('#scanModal').hidden = true; });
+  on('#scanModal', 'click', e => {
+    if (e.target && e.target.id === 'scanModal') $('#scanModal').hidden = true;
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !$('#scanModal').hidden) $('#scanModal').hidden = true;
+  });
+
   // 动作
   $('#btnAnalyze').addEventListener('click', handleAnalyze);
   $('#btnSolve').addEventListener('click', handleSolve);
@@ -2426,6 +2793,28 @@ function bindEvents() {
     if (agentAbort) agentAbort.abort();
   });
   on('#btnDownload', 'click', handleDownload);
+  on('#btnAnsEdit', 'click', () => openAnsEditor(activePage()));
+  on('#btnCompose', 'click', handleCompose);
+
+  // 作答结果编辑器
+  on('#ansCompose', 'click', composeFromEditor);
+  on('#ansExport', 'click', () => {
+    const p = activePage();
+    if (!p || !p.result) return toast('还没有可导出的结果', 'warn');
+    const name = String(p.name || '作答').replace(/\.[^.]+$/, '') + '_作答.png';
+    downloadUrl(p.result, name);
+  });
+  on('#ansClose', 'click', () => { $('#ansEditor').hidden = true; });
+  on('#ansSloppy', 'input', e => {
+    $('#ansSloppyNum').textContent = e.target.value + '%';
+  });
+  on('#ansInkSeg', 'click', e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    $$('#ansInkSeg button').forEach(x => x.classList.toggle('active', x === b));
+    state.ansInk = b.dataset.ink || 'normal';
+  });
+  window.addEventListener('resize', () => syncAnsLayer());
   $('#btnExportImage').addEventListener('click', handleDownload);
   on('#btnDownloadAll', 'click', handleDownloadAll);
 

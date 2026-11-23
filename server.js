@@ -162,6 +162,33 @@ function pickPng(dir, re, exclude) {
   return list[0] ? list[0].f : '';
 }
 
+/* 引擎没写 layout.json 时的兜底：直接用 commands.json 的锁定框生成可编辑布局 */
+function buildLayoutFromCommands(runDir) {
+  const cp = path.join(runDir, 'commands.json');
+  if (!fs.existsSync(cp)) return null;
+  let data = null;
+  try { data = JSON.parse(fs.readFileSync(cp, 'utf8')); } catch { return null; }
+  const items = [];
+  for (const c of data.items || []) {
+    let box = c.lock;
+    if (!Array.isArray(box) || box.length !== 4) {
+      if (c.type === 'work' && typeof c.x === 'number') {
+        box = [c.x, c.y, Math.min(1, c.x + (c.w || 0.8)),
+          Math.min(1, c.y + 0.18)];
+      } else {
+        const y = Number(c.y || 0.5);
+        box = [0.55, y - 0.014, 0.62, y + 0.014];
+      }
+    }
+    items.push({
+      q: c.q, type: c.type, box,
+      text: c.text, num: c.num, den: c.den, lines: c.lines || null,
+      size: c.size || null
+    });
+  }
+  return items.length ? { items } : null;
+}
+
 async function handleAgent(req, res) {
   let runDir = null;
   let child = null;
@@ -193,6 +220,23 @@ async function handleAgent(req, res) {
     }
 
     const task = String(payload.task || '识别并作答这张试卷，严格按 AGENTS.md 流程执行。');
+    const stage = ['scan', 'render', 'compose'].includes(payload.stage) ? payload.stage : 'full';
+    if (stage === 'render' && payload.plan) {
+      fs.writeFileSync(path.join(runDir, 'plan.json'),
+        JSON.stringify({ ...payload.plan, profile: payload.profile || null }), 'utf8');
+    }
+    if (stage === 'compose') {
+      if (!payload.layout) return sendJson(res, 400, { ok: false, error: '缺少确认后的布局' });
+      fs.writeFileSync(path.join(runDir, 'layout.json'),
+        JSON.stringify(payload.layout), 'utf8');
+      // 沿用上一轮导出的扫描件做底图，保证和用户调框时看到的是同一张
+      const prev = String(payload.dir || '');
+      const prevScan = prev ? path.join(prev, 'scan.png') : '';
+      if (prevScan && prevScan.startsWith(RUNS_DIR + path.sep)
+          && fs.existsSync(prevScan)) {
+        fs.copyFileSync(prevScan, path.join(runDir, 'scan.png'));
+      }
+    }
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
@@ -222,13 +266,17 @@ async function handleAgent(req, res) {
       env.LLM_BASE_URL = String(l.base || '');
       env.LLM_MODEL = String(l.model || '');
     }
-    child = spawn(
-      PY,
-      ['-u', AGENT_SCRIPT, '--image', imgPath, '--task', task, '--workspace', runDir],
-      { cwd: runDir, env, windowsHide: true }
-    );
+    const args = ['-u', AGENT_SCRIPT, '--image', imgPath, '--task', task, '--workspace', runDir];
+    if (stage !== 'full') args.push('--stage', stage);
+    child = spawn(PY, args, { cwd: runDir, env, windowsHide: true });
 
     const tail = [];
+    const errTail = () => {
+      const hit = tail.filter(l =>
+        /\[vision\]|\[llm\]|\[scan\]|\[render\]|HTTP|Error|Traceback/i.test(l));
+      const src = hit.length ? hit.slice(-6) : tail.slice(-8);
+      return src.join(' / ') || '无输出';
+    };
     let buf = '';
     const onData = chunk => {
       buf += chunk.toString('utf8');
@@ -269,24 +317,73 @@ async function handleAgent(req, res) {
       if (res.writableEnded) return;
       if (buf.trim()) sseWrite(res, { type: 'log', text: buf.trim() });
       try {
-        const resultFile = pickPng(runDir, /作答/, /校准/);
-        const calibFile = pickPng(runDir, /校准/);
         const rel = f => '/.agent_runs/' + encodeURIComponent(id) + '/' + encodeURIComponent(f);
-        if (!resultFile) {
-          sseWrite(res, {
-            type: 'error',
-            text: killed
-              ? '运行超时，已中止（10 分钟）'
-              : ('智能体没有产出作答图（退出码 ' + code + '）：' + (tail.slice(-3).join(' / ') || '无输出'))
-          });
+        if (stage === 'compose') {
+          const finalFile = pickPng(runDir, /定稿/, /校准/);
+          const calibFile = pickPng(runDir, /定稿_校准|定稿校准/);
+          if (!finalFile) {
+            sseWrite(res, {
+              type: 'error',
+              text: '定稿失败（退出码 ' + code + '）：'
+                + (errTail() || '无输出')
+            });
+          } else {
+            sseWrite(res, {
+              type: 'done',
+              result: rel(finalFile),
+              calib: calibFile ? rel(calibFile) : '',
+              dir: runDir,
+              code
+            });
+          }
+        } else if (stage === 'scan') {
+          const planPath = path.join(runDir, 'plan.json');
+          const boxFile = pickPng(runDir, /框选/);
+          const scanFile = fs.existsSync(path.join(runDir, 'scan.png')) ? 'scan.png' : '';
+          const docFile = fs.existsSync(path.join(runDir, 'document.png')) ? 'document.png' : '';
+          if (!fs.existsSync(planPath)) {
+            sseWrite(res, {
+              type: 'error',
+              text: killed ? '扫描超时，已中止'
+                : ('扫描没有产出位置计划（退出码 ' + code + '）：' + errTail())
+            });
+          } else {
+            sseWrite(res, {
+              type: 'done',
+              plan: JSON.parse(fs.readFileSync(planPath, 'utf8')),
+              preview: boxFile ? rel(boxFile) : '',
+              scan: scanFile ? rel(scanFile) : '',
+              doc: docFile ? rel(docFile) : '',
+              dir: runDir,
+              code
+            });
+          }
         } else {
-          sseWrite(res, {
-            type: 'done',
-            result: rel(resultFile),
-            calib: calibFile ? rel(calibFile) : '',
-            dir: runDir,
-            code
-          });
+          const resultFile = pickPng(runDir, /作答/, /校准/);
+          const calibFile = pickPng(runDir, /校准/);
+          if (!resultFile) {
+            sseWrite(res, {
+              type: 'error',
+              text: killed
+                ? '运行超时，已中止（10 分钟）'
+                : ('智能体没有产出作答图（退出码 ' + code + '）：' + errTail())
+            });
+          } else {
+            const layoutPath = path.join(runDir, 'layout.json');
+            let layout = null;
+            if (fs.existsSync(layoutPath)) {
+              try { layout = JSON.parse(fs.readFileSync(layoutPath, 'utf8')); } catch { layout = null; }
+            }
+            if (!layout) layout = buildLayoutFromCommands(runDir);
+            sseWrite(res, {
+              type: 'done',
+              result: rel(resultFile),
+              calib: calibFile ? rel(calibFile) : '',
+              layout,
+              dir: runDir,
+              code
+            });
+          }
         }
       } catch (e) {
         sseWrite(res, { type: 'error', text: '读取结果失败：' + e.message });

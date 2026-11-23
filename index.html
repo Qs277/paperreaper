@@ -82,6 +82,8 @@
             <button data-view="calib" disabled>校准图</button>
           </div>
           <span class="meta" id="stageMeta">等待上传图片</span>
+          <button class="btn tiny ghost scan-open" id="btnScanView" hidden>扫描件</button>
+          <button class="btn tiny ghost scan-open" id="btnDocView" hidden>文档</button>
         </div>
 
         <div class="canvas-wrap" id="canvasWrap">
@@ -119,34 +121,35 @@
       <!-- 右栏 -->
       <aside class="rail rail-right">
         <div class="rail-head">生成</div>
-        <div class="seg" id="outputSeg">
+        <div class="seg" id="outputSeg" hidden>
           <button class="active" data-output="agent">智能体</button>
           <button data-output="precise">精准落位</button>
         </div>
-        <p class="hint" id="outputHint">智能体：自动识题、解题、落笔并逐题自检。</p>
+        <p class="hint" id="outputHint" hidden>智能体：自动识题、解题、落笔并逐题自检。</p>
 
         <div class="stack">
-          <button class="btn primary block" id="btnAuto">一键识图 + 落笔</button>
-          <button class="btn ghost block" id="btnAnalyze">仅识图分析</button>
-          <button class="btn accent block" id="btnSolve" disabled>重新生成作答图</button>
+          <button class="btn primary block" id="btnAuto">一键作答</button>
+          <button class="btn ghost block" id="btnAnalyze" hidden>仅识图分析</button>
+          <button class="btn accent block" id="btnSolve" disabled hidden>重新生成作答图</button>
+          <button class="btn primary block" id="btnCompose" hidden>确认位置，生成定稿</button>
           <button class="btn ghost block" id="btnAgentStop" hidden>中止运行</button>
         </div>
-        <p class="hint" id="solveHint">上传图片后直接点「一键识图 + 落笔」；智能体模式无需先识图。</p>
+        <p class="hint" id="solveHint" hidden>上传图片后直接点「一键作答」。</p>
 
-        <div class="rail-block">
-          <div class="rail-head">学习你的字体 <span class="badge" id="fontBadge" hidden>已学习</span></div>
-          <p class="hint">上传往期作答照片，学习墨色、字号与工整度；学习后覆盖上方设置。</p>
+        <div class="rail-block" id="fontBlock">
+          <div class="rail-head">导入字迹并仿写 <span class="badge" id="fontBadge" hidden>已学习</span></div>
+          <p class="hint">上传你以前写过的作业照片，学习墨色、字号与工整度；之后作答会按这个风格写。</p>
           <div class="font-thumbs" id="fontThumbs"></div>
           <div class="stack">
-            <button class="btn ghost block" id="btnLearnUpload">上传往期作答</button>
-            <button class="btn primary block" id="btnLearnApply" disabled>学习并应用</button>
+            <button class="btn ghost block" id="btnLearnUpload">导入往期字迹</button>
+            <button class="btn primary block" id="btnLearnApply" disabled>仿写我的字迹</button>
             <button class="btn ghost block danger" id="btnLearnClear" hidden>清除学习</button>
           </div>
           <p class="hint" id="fontNote"></p>
           <input type="file" id="fontFileInput" accept="image/*" multiple hidden>
         </div>
 
-        <div class="rail-block">
+        <div class="rail-block" id="neatBlock" hidden>
           <div class="rail-head">笔迹细节</div>
           <div class="slider-row">
             <span class="slider-name">工整</span>
@@ -163,6 +166,7 @@
     <div class="uploadbar">
       <button class="btn primary" id="btnUploadBottom">选择图片</button>
       <div class="page-strip" id="pageStrip"></div>
+      <button class="btn" id="btnAnsEdit" title="打开作答结果编辑窗，拖动答案位置" disabled>调整答案</button>
       <button class="btn" id="btnExportImage" title="同时导出结果图和校准图" disabled>导出图片</button>
       <button class="btn tiny danger" id="btnClear" disabled>清空</button>
     </div>
@@ -244,8 +248,63 @@
 
 </main>
 
+<!-- ============ 扫描件查看 ============ -->
+<div class="scan-modal" id="scanModal" hidden>
+  <div class="scan-panel">
+    <div class="scan-head">
+      <b id="viewerTitle">扫描件</b>
+      <span class="meta" id="scanMeta"></span>
+      <div class="scan-actions">
+        <a class="btn tiny ghost" id="scanOpen" href="#" target="_blank" rel="noopener">新窗口打开</a>
+        <button class="btn tiny" id="scanClose">关闭</button>
+      </div>
+    </div>
+    <div class="scan-body"><img id="scanImg" alt="扫描件"></div>
+  </div>
+</div>
+
+<!-- ============ 作答结果编辑 ============ -->
+<div class="ans-editor" id="ansEditor" hidden>
+  <div class="ans-panel">
+    <div class="ans-head">
+      <b>作答结果</b>
+      <span class="meta" id="ansMeta">可拖动框移动答案，拖右下角改大小</span>
+      <div class="ans-actions">
+        <button class="btn tiny" id="ansCompose">确认位置，生成定稿</button>
+        <button class="btn tiny primary" id="ansExport">导出</button>
+        <button class="btn tiny ghost" id="ansClose">关闭</button>
+      </div>
+    </div>
+    <div class="ans-body">
+      <div class="ans-stage" id="ansStage">
+        <img id="ansImg" alt="作答结果">
+        <div class="ans-layer" id="ansLayer"></div>
+      </div>
+      <aside class="ans-side">
+        <div class="side-block">
+          <div class="side-title">墨色</div>
+          <div class="seg mini" id="ansInkSeg">
+            <button data-ink="heavy">浓黑</button>
+            <button class="active" data-ink="normal">标准</button>
+            <button data-ink="light">淡墨</button>
+          </div>
+        </div>
+        <div class="side-block">
+          <div class="side-title">潦草程度 <span id="ansSloppyNum">35%</span></div>
+          <input type="range" id="ansSloppy" min="0" max="100" step="5" value="35">
+        </div>
+        <p class="side-hint">定稿只按你调整后的框重新落笔，不再调用模型。</p>
+        <div class="side-block">
+          <div class="side-title">答案列表</div>
+          <div class="ans-list" id="ansList"></div>
+        </div>
+      </aside>
+    </div>
+  </div>
+</div>
+
 <div class="toast-wrap" id="toastWrap"></div>
 
-<script src="app.js?v=20261122e"></script>
+<script src="app.js?v=20261123n"></script>
 </body>
 </html>

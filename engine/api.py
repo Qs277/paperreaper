@@ -62,9 +62,10 @@ def _grain(layer, strength=0.16):
     return layer
 
 
-def text_layer(text, size, font_path, erode, ink=INK, grain=False, thicken=0, jitter=False, seed=None):
+def text_layer(text, size, font_path, erode, ink=INK, grain=False, thicken=0, jitter=False, seed=None,
+               profile=None):
     if jitter and text:
-        return _jitter_layer(text, size, font_path, erode, ink, grain, thicken, seed)
+        return _jitter_layer(text, size, font_path, erode, ink, grain, thicken, seed, profile)
     font = ImageFont.truetype(font_path, max(8, int(size * S)))
     box = font.getbbox(text)
     layer = Image.new('RGBA', (box[2] - box[0] + 40 * S, box[3] - box[1] + 40 * S), (0, 0, 0, 0))
@@ -113,8 +114,19 @@ def _elastic(g, rng, amp):
     return g.transform((w, h), Image.MESH, mesh, resample=Image.BICUBIC)
 
 
-def _jitter_layer(text, size, font_path, erode, ink, grain, thicken, seed):
-    """逐字做仿射 + 弹性形变 + 笔重差异，避免同一个字母写得一模一样。"""
+def _jitter_layer(text, size, font_path, erode, ink, grain, thicken, seed, profile=None):
+    """逐字做仿射 + 弹性形变 + 风格指纹 + 笔压，避免同一个字母写得一模一样。
+
+    profile（可选）是“这个人的书写习惯”，整行共用，不逐字随机：
+      slant     整体倾斜偏置（>0 右倾，约 ±0.10）
+      x_height  竖向整体比例（0.94~1.06）
+      spacing   字距系数（0.95~1.06）
+      stroke    额外笔重档位（+1 更粗 / -1 更细）
+      ink       覆盖墨色 (r,g,b)
+      pressure  笔压起伏强度（0~0.25，0 关闭）
+      baseline  基线起伏系数（0.6~1.4）
+    """
+    prof = profile or {}
     rng = np.random.default_rng(seed if seed is not None else (abs(hash(text)) % (2 ** 32)))
     base_font = ImageFont.truetype(font_path, max(8, int(size * S)))
     asc, desc = base_font.getmetrics()
@@ -124,8 +136,16 @@ def _jitter_layer(text, size, font_path, erode, ink, grain, thicken, seed):
     pvar = 0.0   # 统一笔重：不再逐字换字体，避免个别字明显偏细偏浅
     period = max(3.0, float(rng.uniform(6.0, 10.0)))  # 基线起伏的“波长”
     phase = float(rng.uniform(0, 2 * math.pi))
-    amp = 0.10 * size * S                             # 基线起伏幅度
+    baseline_k = float(prof.get('baseline', 1.0))
+    base_amp = 0.10 * size * S * baseline_k            # 基线起伏幅度（整行的低频波）
     drift = 0.0
+    slant_bias = float(prof.get('slant', 0.0))
+    xh = float(prof.get('x_height', 1.0))
+    space = float(prof.get('spacing', 1.0))
+    stroke_extra = int(prof.get('stroke', 0))
+    if prof.get('ink') and not grain:
+        ink = tuple(prof['ink'])
+    thicken = max(0, thicken + stroke_extra)
     for i, ch in enumerate(text):
         fp = _pick_font(ch, font_path, rng, pvar)
         fs = max(8, int(size * S * float(rng.uniform(0.97, 1.03))))
@@ -136,7 +156,7 @@ def _jitter_layer(text, size, font_path, erode, ink, grain, thicken, seed):
         g = Image.new('RGBA', (gw, gh), (0, 0, 0, 0))
         ImageDraw.Draw(g).text((pad, pad + max(0, asc - asc_i)), ch, font=fnt, fill=ink + (255,))
         a = g.split()[3]
-        for _ in range(erode):
+        for _ in range(max(0, erode)):
             a = a.filter(ImageFilter.MinFilter(3))
         # 整行统一笔重：不再逐字随机加粗，避免粗细忽胖忽瘦
         for _ in range(thicken):
@@ -145,27 +165,27 @@ def _jitter_layer(text, size, font_path, erode, ink, grain, thicken, seed):
 
         # 独立横纵缩放：同一个字有时偏瘦、有时偏扁
         sx = float(rng.uniform(0.97, 1.03))
-        sy = float(rng.uniform(0.97, 1.03))
+        sy = xh * float(rng.uniform(0.97, 1.03))
         if abs(sx - 1) > 0.004 or abs(sy - 1) > 0.004:
             g = g.resize((max(2, int(g.width * sx)), max(2, int(g.height * sy))), Image.LANCZOS)
-        # 轻微右倾/左倾
-        sh = float(rng.uniform(-0.07, 0.07))
+        # 轻微右倾/左倾：整行倾斜偏置 + 逐字小抖动
+        sh = slant_bias + float(rng.uniform(-0.07, 0.07))
         if abs(sh) > 0.008:
             g = g.transform(g.size, Image.AFFINE, (1, sh, -sh * g.height / 2, 0, 1, 0),
                             resample=Image.BICUBIC)
         # 小角度旋转
         g = g.rotate(float(rng.uniform(-3.0, 3.0)), resample=Image.BICUBIC, expand=False)
-        # 低频弹性形变：让两个相同字母的轮廓也不一样
-        amp = max(1.0, min(3.0, 0.05 * min(g.size)))
-        g = _elastic(g, rng, amp)
+        # 低频弹性形变：让两个相同字母的轮廓也不一样（幅度独立，不能覆盖基线幅度）
+        e_amp = max(1.0, min(3.0, 0.05 * min(g.size)))
+        g = _elastic(g, rng, e_amp)
 
         # 基线：低频正弦 + 缓慢漂移 + 极小逐字噪声，避免一条死直线
         drift += float(rng.normal(0.0, 0.010 * size * S))
-        drift = float(np.clip(drift, -amp, amp))
-        wave = amp * math.sin(2 * math.pi * i / period + phase)
+        drift = float(np.clip(drift, -base_amp, base_amp))
+        wave = base_amp * math.sin(2 * math.pi * i / period + phase)
         dy = int(wave + drift + rng.integers(-S, S + 1))
         glyphs.append((g, pen, dy))
-        pen += int(adv) + int(rng.integers(-S, S + 1))
+        pen += int(adv * space * float(rng.uniform(0.98, 1.02))) + int(rng.integers(-S, S + 1))
     line = Image.new('RGBA', (max(pen + 2 * pad, 2), gh + 6 * S), (0, 0, 0, 0))
     for g, px, dy in glyphs:
         line.alpha_composite(g, (px, 3 * S + dy))
@@ -173,6 +193,19 @@ def _jitter_layer(text, size, font_path, erode, ink, grain, thicken, seed):
     if b:
         line = line.crop(b)
     line = line.resize((max(1, line.width // S), max(1, line.height // S)), Image.LANCZOS)
+
+    # 笔压：沿行方向做低频轻重起伏 + 上浅下深，模拟落笔/收笔压力，不逐字跳动
+    pressure = float(prof.get('pressure', 0.0))
+    if pressure > 0 and line.width > 4:
+        la = np.array(line.split()[3], dtype=np.float32)
+        lw, lh = line.size
+        xs = np.arange(lw, dtype=np.float32)
+        lam = max(36.0, lw * 0.55)
+        field = 1.0 - pressure * 0.5 * (1.0 - np.sin(2 * np.pi * xs / lam + phase))
+        vgrad = np.linspace(1.0 - pressure * 0.45, 1.0, lh, dtype=np.float32)[:, None]
+        la = la * field[None, :] * vgrad
+        line.putalpha(Image.fromarray(np.clip(la, 0, 255).astype(np.uint8)))
+
     # 压深抗锯齿边缘：保证所有字（尤其数字）墨色一致，不发浅
     la = np.array(line.split()[3], dtype=np.float32)
     line.putalpha(Image.fromarray(np.clip(255.0 * np.power(la / 255.0, 0.65), 0, 255).astype(np.uint8)))
@@ -193,7 +226,7 @@ def paste_center(img, layer, cx, cy):
     img.paste(layer, (int(cx - layer.width / 2), int(cy - layer.height / 2)), layer)
 
 
-def draw_text(img, text, rect, bold, size=None, style='pen', fit=False, thicken=0):
+def draw_text(img, text, rect, bold, size=None, style='pen', fit=False, thicken=0, profile=None):
     x, y, w, h = rect
     if size is None:
         size = min(h * 0.86, w * 1.3, 120)
@@ -204,7 +237,7 @@ def draw_text(img, text, rect, bold, size=None, style='pen', fit=False, thicken=
     fp = FALLBACK if any(ch in text for ch in 'αβγθλμπσφω≥≤≠≈') else FONT
     pencil = style == 'pencil'
     layer = text_layer(text, size, fp, 1 if pencil or not bold else 0,
-                       PENCIL if pencil else INK, grain=pencil, thicken=thicken)
+                       PENCIL if pencil else INK, grain=pencil, thicken=thicken, profile=profile)
     if fit:
         layer = fit_layer(layer, w, h)
     elif layer.width > max(w * 1.25, 24):
@@ -214,7 +247,7 @@ def draw_text(img, text, rect, bold, size=None, style='pen', fit=False, thicken=
     return layer.size
 
 
-def draw_fraction(img, num, den, rect, size=None, style='pen', fit=False, thicken=0):
+def draw_fraction(img, num, den, rect, size=None, style='pen', fit=False, thicken=0, profile=None):
     x, y, w, h = rect
     cx, cy = x + w / 2, y + h / 2
     if size is None:
@@ -223,9 +256,11 @@ def draw_fraction(img, num, den, rect, size=None, style='pen', fit=False, thicke
         size = float(size)
     pencil = style == 'pencil'
     ink = PENCIL if pencil else INK
+    if (profile or {}).get('ink') and not pencil:
+        ink = tuple(profile['ink'])
     gap = size * 0.46
-    a = text_layer(num, size, FONT, 0, ink, grain=pencil, thicken=thicken)
-    b = text_layer(den, size, FONT, 0, ink, grain=pencil, thicken=thicken)
+    a = text_layer(num, size, FONT, 0, ink, grain=pencil, thicken=thicken, profile=profile)
+    b = text_layer(den, size, FONT, 0, ink, grain=pencil, thicken=thicken, profile=profile)
     bw = max(12, min(w * 0.5, size * 1.5))
     bar_h = 3
     total_h = a.height + b.height + int(gap * 2) + bar_h

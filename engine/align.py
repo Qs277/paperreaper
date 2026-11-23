@@ -85,8 +85,52 @@ def detect_choice(gray, y_norm, half=0.018, min_x=0.42):
     return {'x0': x0 / w, 'x1': x1 / w, 'cy': cy / h, 'h': ph / h}
 
 
+def _morph_underlines(gray, y_norm, half, max_w=0.24):
+    """形态学找印刷下划线：横向开运算保留长横线，滤掉文字笔画。
+
+    教材页的文字笔画会被 Hough 当成短线，且行距只有 0.02；先做 25px 横向开运算，
+    只留下真正的下划线/分数线，再按长度和页边距过滤。
+    """
+    h, w = gray.shape
+    y0 = max(0, int((y_norm - half) * h))
+    y1 = min(h, int((y_norm + half) * h))
+    if y1 - y0 < 8:
+        return []
+    crop = gray[y0:y1, :]
+    bw = (crop < 122).astype(np.uint8) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+    op = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k)
+    n, _, st, _ = cv2.connectedComponentsWithStats(op, 8)
+    out = []
+    for i in range(1, n):
+        x, y, ww, hh, _ = st[i]
+        if hh > 8 or not (w * 0.035 <= ww <= w * max_w):
+            continue
+        if x < 0.14 * w or x + ww > 0.93 * w:
+            continue
+        out.append({'x0': x / w, 'x1': (x + ww) / w,
+                    'cx': (x + ww / 2) / w, 'cy': (y + y0 + hh / 2) / h})
+    return out
+
+
 def detect_underline(gray, y_norm, half=0.024, anchor_x=None):
-    """找该行答题横线（允许扫描倾斜）：合并短段，取离锚点最近/最右一条。"""
+    """找该行答题横线（允许扫描倾斜）：优先形态学真线，失败再走 Hough。"""
+    morph = _morph_underlines(gray, y_norm, half)
+    # 先按行距过滤，再做“最右/最近”选择：教材页两行只隔 0.02，不过滤会取到上一行
+    morph = [c for c in morph if abs(c['cy'] - y_norm) <= 0.013]
+    if morph:
+        if anchor_x is None:
+            pick = max(morph, key=lambda c: c['x1'])
+        else:
+            pick = min(morph, key=lambda c: abs(c['cx'] - anchor_x))
+        # 只接受离锚点不太远的真线
+        if anchor_x is None or abs(pick['cx'] - anchor_x) <= 0.24:
+            return {'x0': pick['x0'], 'x1': pick['x1'], 'cy': pick['cy']}
+    return _detect_underline_hough(gray, y_norm, half, anchor_x)
+
+
+def _detect_underline_hough(gray, y_norm, half=0.024, anchor_x=None):
+    """原 Hough 路径：找该行答题横线，合并短段，取离锚点最近/最右一条。"""
     h, w = gray.shape
     y0 = max(0, int((y_norm - half) * h))
     y1 = min(h, int((y_norm + half) * h))
@@ -165,7 +209,7 @@ def estimate_offset(gray, items, limit=0.04):
         pairs = _choice_pairs(gray, y, 0.045, 0.42)
         if pairs:
             b = min(pairs, key=lambda c: (abs(c['cy'] - y), -c['x0'], -c['x1']))
-            det.append((it.get('q'), round(b['cy'] - y, 4)))
+            det.append((it.get('q'), round(float(b['cy']) - y, 4)))
     if not det:
         for it in items:
             if it.get('type', 'fill') not in ('fill', 'fraction'):
@@ -174,7 +218,7 @@ def estimate_offset(gray, items, limit=0.04):
             x = float(it['x']) if it.get('x') is not None else None
             b = detect_underline(gray, y, anchor_x=x)
             if b:
-                det.append((it.get('q'), round(b['cy'] - y, 4)))
+                det.append((it.get('q'), round(float(b['cy']) - y, 4)))
     vals = [d for _, d in det if abs(d) <= limit]
     if len(vals) < 3:
         return 0.0, det, False
