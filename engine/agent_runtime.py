@@ -859,6 +859,14 @@ def run_fast(image, task, workspace, retries=2, trace='more'):
         print('[fast] 转写失败，未生成作答')
         return 1
     questions = data['questions']
+    types, nums = _task_scope(task)
+    if types or nums:
+        total = len(questions)
+        questions = _filter_by_scope(questions, types, nums)
+        print(f'[fast] 按作答要求只保留 {len(questions)}/{total} 题')
+        if not questions:
+            print('[fast] 作答要求筛完没有题目，请检查要求')
+            return 1
     print(f'[fast] 识别到 {len(questions)} 题：' + ', '.join(str(q.get('q')) for q in questions))
 
     print('[fast] 1.5/4 扫描版面（括号行 / 横线）')
@@ -1943,6 +1951,48 @@ def _map_box_back(box, kind):
     return [x0, y0, x1, y1]
 
 
+def _task_scope(task):
+    """从作答要求里解析“只做某类题 / 只做某几题”，返回 (types, nums)。"""
+    t = str(task or '')
+    types, nums = set(), set()
+    for clause in re.split(r'[。；;\n]', t):
+        k = max(clause.find('只'), clause.find('仅'))
+        if k < 0:
+            continue
+        for word, ty in (('选择', 'choice'), ('填空', 'fill'),
+                         ('计算', 'work'), ('解答', 'work'),
+                         ('综合', 'work'), ('证明', 'work')):
+            p = clause.find(word)
+            if p >= 0 and k < p:
+                types.add(ty)
+        for m in re.finditer(r'(?:第\s*)?(\d+)\s*(?:[-~～至到—－]\s*(\d+))?\s*题', clause):
+            a = int(m.group(1))
+            b = int(m.group(2) or a)
+            for i in range(min(a, b), min(max(a, b), 199) + 1):
+                nums.add(i)
+        if not nums:
+            for m in re.finditer(r'(?:只做|只答|仅做|仅答)\s*(\d+)\s*[-~～至到—－]\s*(\d+)', clause):
+                a, b = int(m.group(1)), int(m.group(2))
+                for i in range(min(a, b), min(max(a, b), 199) + 1):
+                    nums.add(i)
+    return (types or None), (nums or None)
+
+
+def _filter_by_scope(questions, types, nums):
+    if not types and not nums:
+        return questions
+    out = []
+    for q in questions:
+        ty = str(q.get('type') or '').lower()
+        qn = int(q.get('q') or 0)
+        if types and ty not in types:
+            continue
+        if nums and qn not in nums:
+            continue
+        out.append(q)
+    return out
+
+
 def run_scan(image, task, workspace):
     """第一轮：只扫描定位，输出 plan.json + 框选图，不落笔。"""
     if not image:
@@ -1968,6 +2018,15 @@ def run_scan(image, task, workspace):
         print('[scan] 视觉模型不可用，改用本地 OCR 提取题目')
         questions = _sanitize(_normalize_types(_ocr_questions(_enhance_gray(gray))))
     _drop_bad_x(questions)
+    types, nums = _task_scope(task)
+    if types or nums:
+        total = len(questions)
+        questions = _filter_by_scope(questions, types, nums)
+        kept = '、'.join(str(q.get('q')) for q in questions)
+        print(f'[scan] 按作答要求只保留 {len(questions)}/{total} 题：{kept}')
+        if not questions:
+            print('[scan] 作答要求筛完没有题目，请检查要求')
+            return 1
     if not questions:
         print('[scan] 没有识别到题目')
         return 1
@@ -2114,6 +2173,12 @@ def run_render(image, task, workspace, retries=2, trace='more'):
     plan = json.loads(p.read_text(encoding='utf-8'))
     questions = plan.get('questions') or []
     items = plan.get('items') or []
+    types, nums = _task_scope(task)
+    if types or nums:
+        questions = _filter_by_scope(questions, types, nums)
+        items = _filter_by_scope(items, types, nums)
+        kept = '、'.join(str(it.get('q')) for it in items)
+        print(f'[render] 按作答要求只作答 {len(items)} 题：{kept}')
     if not questions or not items:
         print('[render] plan.json 不完整')
         return 1
