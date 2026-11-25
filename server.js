@@ -186,7 +186,12 @@ function buildLayoutFromCommands(runDir) {
       size: c.size || null
     });
   }
-  return items.length ? { items } : null;
+  return items.length ? {
+    style: data.style || 'pen',
+    profile: data.profile || null,
+    items,
+    traces: Array.isArray(data.traces) ? data.traces : []
+  } : null;
 }
 
 async function handleAgent(req, res) {
@@ -228,11 +233,25 @@ async function handleAgent(req, res) {
     }
     if (stage === 'compose') {
       if (!payload.layout) return sendJson(res, 400, { ok: false, error: '缺少确认后的布局' });
-      fs.writeFileSync(path.join(runDir, 'layout.json'),
-        JSON.stringify(payload.layout), 'utf8');
+      let layout = payload.layout;
       // 沿用上一轮导出的扫描件做底图，保证和用户调框时看到的是同一张
       const prev = String(payload.dir || '');
-      const prevScan = prev ? path.join(prev, 'scan.png') : '';
+      const prevDir = prev ? path.resolve(prev) : '';
+      const prevScan = prevDir ? path.join(prevDir, 'scan.png') : '';
+      // 老布局可能只带 items（例如引擎没写 layout.json 时的兜底），痕迹从上一轮命令里补回
+      if (!Array.isArray(layout.traces) || !layout.traces.length) {
+        const prevCmd = prevDir ? path.join(prevDir, 'commands.json') : '';
+        if (prevCmd.startsWith(RUNS_DIR + path.sep) && fs.existsSync(prevCmd)) {
+          try {
+            const pc = JSON.parse(fs.readFileSync(prevCmd, 'utf8'));
+            if (Array.isArray(pc.traces) && pc.traces.length) {
+              layout = { ...layout, traces: pc.traces };
+            }
+          } catch { /* 旧命令损坏就按原布局 */ }
+        }
+      }
+      fs.writeFileSync(path.join(runDir, 'layout.json'),
+        JSON.stringify(layout), 'utf8');
       if (prevScan && prevScan.startsWith(RUNS_DIR + path.sep)
           && fs.existsSync(prevScan)) {
         fs.copyFileSync(prevScan, path.join(runDir, 'scan.png'));

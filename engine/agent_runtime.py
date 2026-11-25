@@ -915,6 +915,7 @@ def run_fast(image, task, workspace, retries=2, trace='more'):
                   f"size={it.get('size')} drift=({d[0]},{d[1]})")
         bad = [it for it in items if not it.get('ok')]
         if not bad:
+            _write_layout(ws, out_png, commands, items)
             print(f'[fast] 4/4 完成，全部通过：{out_png}')
             return 0
         if attempt >= retries:
@@ -929,6 +930,7 @@ def run_fast(image, task, workspace, retries=2, trace='more'):
             it['y'] = round(max(0.02, min(0.97, float(it['y']) + step)), 4)
         print('[fast] 按 drift 修正后重跑')
     print(f'[fast] 仍有未通过项，作答图已保留：{out_png}')
+    _write_layout(ws, out_png, commands, items)
     return 1
 
 
@@ -2191,6 +2193,13 @@ def run_render(image, task, workspace, retries=2, trace='more'):
 def _write_layout(ws, render_img, commands, report):
     """把每题墨迹的最终位置写成可编辑布局，供网页拖拽/缩放后二次合成。"""
     try:
+        _write_layout_impl(ws, render_img, commands, report)
+    except Exception as e:
+        print(f'[render] 写布局失败：{type(e).__name__}: {e}')
+
+
+def _write_layout_impl(ws, render_img, commands, report):
+    try:
         im = cv2.imdecode(np.fromfile(str(render_img), dtype=np.uint8),
                           cv2.IMREAD_GRAYSCALE)
         H, W = im.shape[:2]
@@ -2223,6 +2232,7 @@ def _write_layout(ws, render_img, commands, report):
                       'text': cmd.get('text'), 'num': cmd.get('num'),
                       'den': cmd.get('den'), 'lines': cmd.get('lines')})
     data = {'size': [W, H], 'style': commands.get('style', 'pen'), 'items': items,
+            'profile': commands.get('profile'),
             'traces': commands.get('traces') or []}
     (Path(ws) / 'layout.json').write_text(
         json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
