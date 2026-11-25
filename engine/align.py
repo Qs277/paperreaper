@@ -85,11 +85,12 @@ def detect_choice(gray, y_norm, half=0.018, min_x=0.42):
     return {'x0': x0 / w, 'x1': x1 / w, 'cy': cy / h, 'h': ph / h}
 
 
-def _morph_underlines(gray, y_norm, half, max_w=0.24):
+def _morph_underlines(gray, y_norm, half, max_w=0.24, kern=25):
     """形态学找印刷下划线：横向开运算保留长横线，滤掉文字笔画。
 
-    教材页的文字笔画会被 Hough 当成短线，且行距只有 0.02；先做 25px 横向开运算，
+    教材页的文字笔画会被 Hough 当成短线，且行距只有 0.02；先做横向开运算，
     只留下真正的下划线/分数线，再按长度和页边距过滤。
+    扫描件横线通常有 1~2° 倾斜，25px 核会把它切断；版面扫描用 kern=16 更稳。
     """
     h, w = gray.shape
     y0 = max(0, int((y_norm - half) * h))
@@ -98,7 +99,7 @@ def _morph_underlines(gray, y_norm, half, max_w=0.24):
         return []
     crop = gray[y0:y1, :]
     bw = (crop < 122).astype(np.uint8) * 255
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, int(kern)), 1))
     op = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k)
     n, _, st, _ = cv2.connectedComponentsWithStats(op, 8)
     out = []

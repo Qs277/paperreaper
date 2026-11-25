@@ -13,6 +13,10 @@
     {"q": 1, "type": "choice", "text": "D", "y": 0.113},
     {"q": 7, "type": "fraction", "num": "1", "den": "2", "y": 0.765},
     {"q": 9, "type": "work", "x": 0.10, "y": 0.30, "w": 0.82, "lines": ["…", "…"]}
+  ],
+  "traces": [
+    {"q": 1, "type": "circle", "box": [0.57, 0.10, 0.63, 0.13]},
+    {"q": 2, "type": "tick",   "box": [0.64, 0.18, 0.67, 0.21]}
   ]
 }
 
@@ -22,6 +26,7 @@ y 只用来圈定“哪一行”，不需要精确；x / size 可省略，仅在
       [--rectify auto|off|force] [--scan 扫描件.png]
 """
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -69,6 +74,9 @@ def _fix_eligible(it):
 
 STYLES = ('double', 'cross', 'single', 'horizontal', 'zigzag', 'circle')
 
+# 做题痕迹：圈画 / 波浪下划线 / 双下划线 / 对勾 / 涂改
+TRACE_KINDS = ('circle', 'wave', 'double', 'tick', 'scribble')
+
 
 def _pick_style(fix_style, rng):
     if fix_style in ('mix', None, ''):
@@ -113,6 +121,91 @@ def _strike(img, box, ink, rng, style='double'):
             d.line([(x0 + span * 0.15 + ox, y1 + 2),
                     (x0 + span * 0.85 + ox, y0 - 2)],
                    fill=ink + (255,), width=w)
+
+
+def _trace_points(kind, w, h, rng):
+    """返回若干条折线（局部坐标，原点在痕迹框左上角）。"""
+    lines = []
+    if kind == 'circle':
+        cx, cy = w / 2.0, h / 2.0
+        rx, ry = w * 0.52, h * 0.60
+        n = max(48, int((rx + ry)))
+        start, end = -0.22 * math.pi, 1.96 * math.pi
+        pts = []
+        for i in range(n):
+            t = start + (end - start) * i / (n - 1)
+            wob = 1.0 + 0.045 * math.sin(3.1 * t + 0.8) + float(rng.uniform(-0.015, 0.015))
+            pts.append((cx + rx * wob * math.cos(t), cy + ry * wob * math.sin(t)))
+        lines.append(pts)
+        lines.append([pts[-1], (pts[-1][0] + rx * 0.16, pts[-1][1] + ry * 0.16)])
+    elif kind == 'wave':
+        n = max(26, int(w / 7))
+        amp = max(2.0, h * 0.45)
+        cyc = max(2.2, w / 85.0)
+        lines.append([(w * i / (n - 1),
+                       h / 2.0 + amp * math.sin(2 * math.pi * cyc * i / (n - 1) + 0.45))
+                      for i in range(n)])
+    elif kind == 'double':
+        lines.append([(0.0, h * 0.28), (w * 0.34, h * 0.22), (w * 0.70, h * 0.27), (w, h * 0.21)])
+        lines.append([(1.0, h * 0.80), (w * 0.32, h * 0.84), (w * 0.68, h * 0.79), (w - 1.0, h * 0.83)])
+    elif kind == 'tick':
+        lines.append([(w * 0.10, h * 0.54), (w * 0.33, h * 0.88), (w * 0.95, h * 0.10)])
+    elif kind == 'scribble':
+        n = max(12, int(w / 14))
+        lines.append([(w * i / (n - 1), h * (0.16 if i % 2 == 0 else 0.84)) for i in range(n)])
+        lines.append([(w * 0.04, h * 0.58), (w * 0.34, h * 0.32),
+                      (w * 0.66, h * 0.72), (w * 0.96, h * 0.42)])
+    return lines
+
+
+def _draw_trace(im, trace, ink, seed):
+    """把一种做题痕迹画到照片坐标里；box 为照片归一化坐标。"""
+    kind = str(trace.get('type') or 'circle').lower()
+    if kind not in TRACE_KINDS:
+        kind = 'circle'
+    box = trace.get('box')
+    if not box or len(box) < 4:
+        return None
+    W, H = im.size
+    nx0, ny0, nx1, ny1 = [float(v) for v in box[:4]]
+    x0, y0 = nx0 * W, ny0 * H
+    cw, ch = max(2.0, (nx1 - nx0) * W), max(2.0, (ny1 - ny0) * H)
+    pad = int(max(9.0, max(cw, ch) * 0.24))
+    lw, lh = int(round(cw)) + 2 * pad, int(round(ch)) + 2 * pad
+    if lw < 6 or lh < 6 or lw > W or lh > H:
+        return None
+    S2 = 2
+    layer = Image.new('RGBA', (lw * S2, lh * S2), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    rng = np.random.default_rng(seed)
+    width = float(trace.get('w') or max(2.6, min(cw, ch) * 0.085))
+    width = max(2.0, min(width, 8.0)) * S2
+    for pts in _trace_points(kind, cw, ch, rng):
+        for pi in range(2):
+            ox = float(rng.uniform(-1.0, 1.0)) if pi else 0.0
+            oy = float(rng.uniform(-1.0, 1.0)) if pi else 0.0
+            P = [((px + pad + ox) * S2 + float(rng.uniform(-0.8, 0.8)) * S2,
+                  (py + pad + oy) * S2 + float(rng.uniform(-0.8, 0.8)) * S2) for px, py in pts]
+            d.line(P, fill=ink + (236 if pi == 0 else 110,), width=int(round(width)), joint='curve')
+    layer = layer.resize((lw, lh), Image.LANCZOS)
+    layer = layer.rotate(float(rng.uniform(-2.2, 2.2)), resample=Image.BICUBIC, expand=False)
+    a = np.array(layer.split()[3], dtype=np.float32)
+    layer.putalpha(Image.fromarray(np.clip(255.0 * np.power(a / 255.0, 0.72), 0, 255).astype(np.uint8)))
+    left, top = int(round(x0)) - pad, int(round(y0)) - pad
+    if left < 0 or top < 0 or left + lw > W or top + lh > H:
+        sx0, sy0 = max(0, left), max(0, top)
+        crop = layer.crop((sx0 - left, sy0 - top,
+                           min(lw, W - left), min(lh, H - top)))
+        im.alpha_composite(crop, (sx0, sy0))
+        layer = crop
+    else:
+        im.alpha_composite(layer, (left, top))
+    bb = layer.getbbox()
+    return {
+        'q': trace.get('q'), 'kind': kind, 'box': [x0, y0, x0 + cw, y0 + ch],
+        'ink': [int(left + bb[0]), int(top + bb[1]),
+                int(left + bb[2]), int(top + bb[3])] if bb else None,
+    }
 
 
 def _near_offsets(max_off=0.032, step=0.006):
@@ -601,6 +694,10 @@ def main():
     if pick:
         sp = np.random.default_rng(20240602).permutation(len(STYLES))
         style_map = {idx: STYLES[int(sp[j % len(STYLES)])] for j, idx in enumerate(sorted(pick))}
+    # 命令里写了 "fix": true 的题强制涂改（给示例/人工指定用）
+    for i, it in enumerate(items):
+        if it.get('fix') and _fix_eligible(it):
+            pick.add(i)
     im = Image.open(args[0]).convert('RGBA')
     W, H = im.size
     bgr = cv2.cvtColor(np.array(im.convert('RGB')), cv2.COLOR_RGB2BGR)
@@ -678,14 +775,33 @@ def main():
             rep['ink'] = rectify.box_back(rep['ink'], Hi, W, H)
             rep['blank'] = rectify.box_back(rep['blank'], Hi, W, H)
 
+    # 做题痕迹：直接用照片坐标落笔，不再做任何换算，保证位置不漂
+    traces = cmd.get('traces') or []
+    trace_report = []
+    if traces:
+        tink = api.PENCIL if style == 'pencil' else tuple(profile.get('ink') or api.INK)
+        for i, tr in enumerate(traces):
+            if not isinstance(tr, dict):
+                continue
+            seed = abs(hash('%s|%s|%s' % (tr.get('q'), tr.get('type'), i))) % (2 ** 32)
+            rep = _draw_trace(im, tr, tink, seed)
+            if rep:
+                trace_report.append(rep)
+
     out = Path(args[2])
     im.convert('RGB').save(out)
     if calib:
         draw_calib(im, report)
+        if trace_report:
+            dc = ImageDraw.Draw(im)
+            for r in trace_report:
+                x0, y0, x1, y1 = r['box']
+                dc.rectangle([x0, y0, x1, y1], outline=(150, 80, 200), width=2)
+                dc.text((x0 + 2, max(0, y0 - 14)), str(r.get('kind')), fill=(150, 80, 200))
         im.convert('RGB').save(calib)
     summary = {'out': str(out), 'style': style, 'off_y': round(off_y, 4),
                'rectified': bool(use_rect), 'page_ratio': round(qratio, 3),
-               'offset_detail': det, 'items': report}
+               'offset_detail': det, 'items': report, 'traces': trace_report}
     if use_rect:
         summary['scan_size'] = [SW, SH]
         summary['corners'] = [[round(float(x), 1), round(float(y), 1)] for x, y in quad]

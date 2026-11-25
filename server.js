@@ -221,9 +221,10 @@ async function handleAgent(req, res) {
 
     const task = String(payload.task || '识别并作答这张试卷，严格按 AGENTS.md 流程执行。');
     const stage = ['scan', 'render', 'compose'].includes(payload.stage) ? payload.stage : 'full';
+    const trace = ['none', 'less', 'more'].includes(payload.trace) ? payload.trace : 'more';
     if (stage === 'render' && payload.plan) {
       fs.writeFileSync(path.join(runDir, 'plan.json'),
-        JSON.stringify({ ...payload.plan, profile: payload.profile || null }), 'utf8');
+        JSON.stringify({ ...payload.plan, profile: payload.profile || null, trace }), 'utf8');
     }
     if (stage === 'compose') {
       if (!payload.layout) return sendJson(res, 400, { ok: false, error: '缺少确认后的布局' });
@@ -268,6 +269,7 @@ async function handleAgent(req, res) {
     }
     const args = ['-u', AGENT_SCRIPT, '--image', imgPath, '--task', task, '--workspace', runDir];
     if (stage !== 'full') args.push('--stage', stage);
+    args.push('--trace', trace);
     child = spawn(PY, args, { cwd: runDir, env, windowsHide: true });
 
     const tail = [];

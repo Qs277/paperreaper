@@ -85,6 +85,13 @@ const INK_TONES = {
   light: { color: '#3b3b3b', label: '淡墨' }
 };
 
+const TRACE_LEVELS = ['none', 'less', 'more'];
+const TRACE_HINTS = {
+  none: '不留做题痕迹，只写答案。',
+  less: '只圈重点题的关键词，痕迹更干净。',
+  more: '每题都圈画关键词、题号打勾、划掉错误选项。'
+};
+
 const state = {
   vision: { ...DEFAULTS.vision },
   llm: { ...DEFAULTS.llm },
@@ -95,6 +102,7 @@ const state = {
   selectedQ: -1,
   inkTone: 'normal',
   ansInk: 'normal',
+  traceLevel: 'more',
   requirement: '',
   reqScale: 1,
   fontProfile: null,
@@ -157,6 +165,7 @@ function loadConfig() {
   state.human.neatness = Number.isFinite(saved?.neatness) ? saved.neatness : 35;
   state.human.size = Number.isFinite(saved?.size) ? saved.size : 120;
   if (saved?.inkTone && INK_TONES[saved.inkTone]) state.inkTone = saved.inkTone;
+  state.traceLevel = TRACE_LEVELS.includes(saved?.traceLevel) ? saved.traceLevel : 'more';
   state.requirement = typeof saved?.requirement === 'string' ? saved.requirement : '';
   if (saved?.fontProfile && typeof saved.fontProfile === 'object') state.fontProfile = saved.fontProfile;
 }
@@ -170,6 +179,7 @@ function saveConfig(silent = false) {
     neatness: state.human.neatness,
     size: state.human.size,
     inkTone: state.inkTone,
+    traceLevel: state.traceLevel,
     requirement: state.requirement,
     fontProfile: state.fontProfile
   };
@@ -232,6 +242,13 @@ function syncHumanUI() {
 
 function syncInkUI() {
   $$('#inkSwatches button').forEach(b => b.classList.toggle('active', b.dataset.ink === state.inkTone));
+}
+
+function syncTraceUI() {
+  const level = TRACE_LEVELS.includes(state.traceLevel) ? state.traceLevel : 'more';
+  $$('#traceSeg button').forEach(b => b.classList.toggle('active', b.dataset.trace === level));
+  const hint = $('#traceHint');
+  if (hint) hint.textContent = TRACE_HINTS[level];
 }
 
 function updateFontLock() {
@@ -1532,6 +1549,7 @@ async function runAgentStage(page, stage, plan, extra) {
           layout: extra?.layout || null,
           dir: extra?.dir || '',
           profile: styleProfile(),
+          trace: state.traceLevel,
           keys: {
             vision: { ...state.vision },
             llm: { ...state.llm }
@@ -2681,6 +2699,12 @@ function bindEvents() {
     updateHint();
   }));
 
+  $$('#traceSeg button').forEach(btn => btn.addEventListener('click', () => {
+    state.traceLevel = btn.dataset.trace;
+    syncTraceUI();
+    saveConfig(true);
+  }));
+
   // 作答要求
   $('#btnApplyReq').addEventListener('click', () => applyRequirement(true));
   $('#btnClearReq').addEventListener('click', () => {
@@ -2899,6 +2923,7 @@ function init() {
   loadConfig();
   syncSettingsUI();
   syncHumanUI();
+  syncTraceUI();
   bindEvents();
   $('#reqInput').value = state.requirement || '';
   state.reqScale = reqScaleFor(state.requirement || '');

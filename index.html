@@ -149,6 +149,16 @@
           <input type="file" id="fontFileInput" accept="image/*" multiple hidden>
         </div>
 
+        <div class="rail-block" id="traceBlock">
+          <div class="rail-head">做题痕迹</div>
+          <div class="seg" id="traceSeg">
+            <button data-trace="none">无</button>
+            <button data-trace="less">少</button>
+            <button class="active" data-trace="more">多</button>
+          </div>
+          <p class="hint" id="traceHint">每题都圈画关键词、题号打勾、划掉错误选项。</p>
+        </div>
+
         <div class="rail-block" id="neatBlock" hidden>
           <div class="rail-head">笔迹细节</div>
           <div class="slider-row">

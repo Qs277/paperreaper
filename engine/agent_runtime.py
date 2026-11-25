@@ -594,7 +594,9 @@ def _scan_layout_gray(gray):
         else:
             ch.append(b)
     for i in range(60, 995, 10):
-        unders.extend(align._morph_underlines(gray, i / 1000.0, 0.012, max_w=0.60))
+        # kern=16：扫描件横线有轻微倾斜，25px 核会把长横线切碎
+        unders.extend(align._morph_underlines(gray, i / 1000.0, 0.012,
+                                              max_w=0.60, kern=16))
     unders.sort(key=lambda c: c['cy'])
     un = []
     for c in unders:
@@ -840,7 +842,7 @@ def _audit_bounds(questions, solutions):
     return out
 
 
-def run_fast(image, task, workspace, retries=2):
+def run_fast(image, task, workspace, retries=2, trace='more'):
     """受控流程：一次转写 -> 一次解题 -> 固定 commands -> 落笔 -> 只修失败题。"""
     if not image:
         print('缺少 --image')
@@ -850,6 +852,7 @@ def run_fast(image, task, workspace, retries=2):
         print('缺少视觉模型配置 VISION_BASE_URL / VISION_MODEL / VISION_API_KEY')
         return 2
     ws = Path(workspace).resolve()
+    ws.mkdir(parents=True, exist_ok=True)
     print('[fast] 1/4 整页转写')
     data = _vision_json(image, task, vision)
     if not data:
@@ -875,7 +878,23 @@ def run_fast(image, task, workspace, retries=2):
 
     (ws / 'questions.json').write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
     (ws / 'solutions.json').write_text(json.dumps(solutions, ensure_ascii=False, indent=1), encoding='utf-8')
-    commands = _build_commands(questions, solutions, ch_rows, fl_rows)
+    gray = cv2.imdecode(np.fromfile(str(image), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    ocr_lines = None
+    if gray is not None:
+        try:
+            ocr_lines = _ocr_lines(_enhance_gray(gray))
+        except Exception as e:
+            print(f'[fast] OCR 失败，跳过：{e}')
+    items = _plan_items(questions, ch_rows, fl_rows, gray, ocr_lines)
+    commands = _commands_from_plan(items, solutions, gray)
+    if commands['items'] and gray is not None:
+        try:
+            tr = _auto_traces(gray, items, solutions, trace)
+            if tr:
+                commands['traces'] = tr
+                print(f'[fast] 做题痕迹 {len(tr)} 条（{trace}）')
+        except Exception as e:
+            print(f'[fast] 做题痕迹生成失败：{type(e).__name__}: {e}')
     if not commands['items']:
         print('[fast] 没有可落笔的答案')
         return 1
@@ -917,9 +936,15 @@ def _normalize_types(questions):
     """没有选项的“选择题”是误判：按题干改成填空或解答题。"""
     for q in questions:
         opts = q.get('options') or []
-        if (q.get('type') or '').lower() == 'choice' and len(opts) < 2:
-            stem = q.get('stem') or ''
+        typ = (q.get('type') or '').lower()
+        stem = q.get('stem') or ''
+        if typ == 'choice' and len(opts) < 2:
             q['type'] = 'work' if re.search(r'证明|求证|推导|推出|说明理由', stem) else 'fill'
+        elif typ in ('fill', 'fraction') \
+                and not re.search(r'_{2,}|[（(]\s*[）)]', stem) \
+                and re.search(r'lim|求下列|计算|证明|解方程|试求', stem):
+            # “(1) lim …”这种没有横线的小题是解答题，不是填空
+            q['type'] = 'work'
     return questions
 
 
@@ -1065,6 +1090,280 @@ def _ocr_lines(gray):
 _Q_START = re.compile(r'^\s*[（(]?\s*(\d{1,2})\s*[.．、)）]')
 
 
+# ---------------- 做题痕迹（画在题目内容上） ----------------
+_TRACE_KW = ('极小值', '极大值', '最小值', '最大值', '拐点', '曲率', '渐近线',
+             '可导', '连续', '单调', '极值', '凹凸', '切线', '法线', '极限',
+             '导数', '面积', '体积', '零点', '积分', '方程', '必有')
+_TRACE_KINDS = ('circle', 'wave', 'double', 'tick')
+
+
+def _line_near(lines, y, tol=0.035):
+    best = None
+    for ln in lines:
+        d = abs(float(ln.get('y', -9)) - y)
+        if d <= tol and (best is None or d < abs(best['y'] - y)):
+            best = ln
+    return best
+
+
+def _keyword_box(ln, kws=_TRACE_KW, limit_x=None):
+    """在行内的 OCR 片段里按字数比例定位关键词，返回圈画框。"""
+    for tok in ln.get('items') or []:
+        t = tok.get('text') or ''
+        if not t:
+            continue
+        for kw in kws:
+            i = t.find(kw)
+            if i < 0:
+                continue
+            w = max(0.004, float(tok['x1']) - float(tok['x0']))
+            x0 = float(tok['x0']) + w * i / len(t)
+            x1 = float(tok['x0']) + w * (i + len(kw)) / len(t)
+            if limit_x is not None and x1 > limit_x:
+                continue
+            hh = max(0.008, min(0.020, float(tok.get('h', 0.02))))
+            return [x0 - 0.004, float(tok['y']) - hh * 0.72,
+                    x1 + 0.004, float(tok['y']) + hh * 0.72]
+    return None
+
+
+def _option_line(lines, letter, y0, max_len=70):
+    pat = re.compile(r'[（(]\s*%s\s*[)）]' % re.escape(letter))
+    best = None
+    for ln in lines:
+        y = float(ln.get('y', -9))
+        if not (y0 - 0.012 <= y <= y0 + 0.10):
+            continue
+        if float(ln['x0']) < 0.05:
+            continue
+        t = (ln.get('text') or '').strip()
+        if pat.search(t) and len(t) <= max_len:
+            if best is None or abs(y - y0) < abs(best['y'] - y0):
+                best = ln
+    return best
+
+
+def _wrong_option_line(lines, ans, y0):
+    for letter in ('D', 'C', 'B', 'E', 'A'):
+        if letter == ans:
+            continue
+        ln = _option_line(lines, letter, y0)
+        if ln is not None:
+            return ln
+    return None
+
+
+def _question_line(lines, y, box=None):
+    """题目行：必须横向覆盖答案框左端，避免落到相邻题/选项/页边噪声上。"""
+    bx0 = float(box[0]) if box and len(box) >= 4 else None
+    best, best_s = None, 9.0
+    for ln in lines:
+        if float(ln['x1']) - float(ln['x0']) < 0.07:
+            continue
+        if len(re.findall(r'[（(]\s*[A-E]\s*[)）]', ln.get('text') or '')) >= 2:
+            continue  # 两行选项被 OCR 粘成一行，不作为题干行
+        d = abs(float(ln['y']) - y)
+        if d > 0.045:
+            continue
+        if bx0 is not None and not (float(ln['x0']) - 0.015 <= bx0 <= float(ln['x1']) + 0.015):
+            continue
+        s = d + (0.03 if float(ln['x0']) < 0.05 else 0.0)
+        if s < best_s:
+            best_s, best = s, ln
+    return best
+
+
+def _text_bottom(gray, x0, x1, y, win=0.012):
+    """在行附近找印刷字的最低墨迹行，保证下划线贴在字下方而不是穿字。"""
+    if gray is None:
+        return None
+    H, W = gray.shape
+    ya = int(max(0, (y - win) * H))
+    yb = int(min(H, (y + win) * H))
+    xa = int(max(0, x0) * W)
+    xb = int(min(W, x1 * W))
+    if yb - ya < 4 or xb - xa < 8:
+        return None
+    band = gray[ya:yb, xa:xb]
+    mask = band < 110
+    need = max(2, int((xb - xa) * 0.02))
+    rows = mask.sum(1)
+    idx = [i for i, v in enumerate(rows) if v >= need]
+    if not idx:
+        return None
+    return (ya + idx[-1]) / H
+
+
+def _trace_under(gray, ln, frac=1.0, extra=0.0, height=0.0068, stop_x=None):
+    x0 = max(0.02, float(ln['x0']) + 0.004)
+    x1 = float(ln['x1']) - 0.004
+    if frac < 1.0:
+        x1 = min(x1, x0 + max(0.02, (x1 - x0) * frac))
+    if stop_x is not None:
+        x1 = min(x1, float(stop_x))
+    x1 = max(x0 + 0.01, x1)
+    bottom = _text_bottom(gray, x0, x1, float(ln['y']))
+    if bottom is not None:
+        y = bottom + 0.0035 + extra
+    else:
+        y = float(ln['y']) + max(0.008, float(ln.get('h', 0.02)) / 2) + 0.004 + extra
+    return [x0, y, x1, y + height]
+
+
+def _keyword_box_any(ln, kws=_TRACE_KW, limit_x=None):
+    """先按 OCR 片段定位关键词；片段切碎时退回整行按字数比例定位。"""
+    kb = _keyword_box(ln, kws, limit_x)
+    if kb is not None:
+        return kb
+    t = ln.get('text') or ''
+    w = float(ln['x1']) - float(ln['x0'])
+    if w <= 0.01 or not t:
+        return None
+    for kw in kws:
+        i = t.find(kw)
+        if i < 0:
+            continue
+        x0 = float(ln['x0']) + w * i / len(t)
+        x1 = float(ln['x0']) + w * (i + len(kw)) / len(t)
+        if limit_x is not None and x1 > limit_x:
+            continue
+        hh = max(0.008, min(0.022, float(ln.get('h', 0.02))))
+        return [x0 - 0.004, float(ln['y']) - hh * 0.72,
+                x1 + 0.004, float(ln['y']) + hh * 0.72]
+    return None
+
+
+def _trim_traces(traces, level):
+    """按挡位裁剪痕迹：none=全不留，less=保留对勾/涂改 + 隔一条留一条，more=全量。"""
+    if level == 'none' or not traces:
+        return []
+    if level != 'less' or len(traces) <= 3:
+        return traces
+    core = {i for i, t in enumerate(traces) if t.get('type') in ('tick', 'scribble')}
+    others = [i for i, t in enumerate(traces) if i not in core]
+    keep = core | set(others[::2])
+    return [t for i, t in enumerate(traces) if i in keep]
+
+
+def _auto_traces(gray, items, solutions, level='more'):
+    """按题目内容自动生成做题痕迹：圈关键词/正确选项、划条件、题号打勾、划掉错项。"""
+    if gray is None or level == 'none':
+        return []
+    lines = _ocr_lines(_enhance_gray(gray))
+    if not lines:
+        return []
+    out = []
+    scribbled = False
+    ticked = False
+    choice_seen = 0
+    work_total = sum(1 for x in items if (x.get('type') or '').lower() == 'work')
+    work_idx = 0
+    for i, it in enumerate(items):
+        if it.get('skip') or it.get('no_trace'):
+            continue
+        typ = (it.get('type') or 'fill').lower()
+        if typ == 'choice':
+            choice_seen += 1
+        box = it.get('box') or []
+        y = ((float(box[1]) + float(box[3])) / 2) if len(box) == 4 \
+            else float(it.get('y', 0.5))
+        ans = ''
+        if i < len(solutions):
+            ans = (_answer_key(solutions[i]) or '').upper()
+        stem = str(it.get('stem') or '')
+        try:
+            qn = int(str(it.get('q')).strip())
+        except (TypeError, ValueError):
+            qn = None
+        # 题目区域：题号行往下到下一个题号行之前
+        start = _qnum_line(lines, qn, y) if qn is not None else None
+        if start is not None:
+            y0 = float(start['y']) - 0.012
+            y1 = min(y0 + 0.10, float(start['y']) + 0.060)
+            for ln in lines:
+                if y0 < float(ln['y']) < y1 and ln is not start:
+                    txt = ln.get('text') or ''
+                    other = re.search(r'[（(]\s*(\d{1,2})\s*[)）]', txt)
+                    if (_qnum(txt) not in (None, qn)
+                            or (other and int(other.group(1)) != qn)):
+                        y1 = float(ln['y']) - 0.004
+                        break
+            region = [ln for ln in lines if y0 <= float(ln['y']) <= y1]
+        else:
+            region = [ln for ln in lines if abs(float(ln['y']) - y) <= 0.038]
+        stem_lines = [ln for ln in region if not _OPT_RE.match(ln.get('text') or '')]
+        if not stem_lines:
+            continue
+        base = min(stem_lines, key=lambda l: abs(float(l['y']) - y))
+        opt = _option_line(lines, ans, y) \
+            if typ == 'choice' and re.fullmatch(r'[A-E]', ans) else None
+        # 圈关键词：先看正确选项，再看题干
+        kb = None
+        for ln in ([opt] if opt is not None else []) + stem_lines:
+            kb = _keyword_box_any(ln)
+            if kb:
+                break
+        if (not ticked) and typ == 'choice':
+            kind = 'tick'
+            ticked = True
+            yy = float(base['y']) - 0.014
+            tb = [0.098, yy - 0.013, 0.118, yy + 0.013]
+        elif typ == 'work':
+            # 同一行并列几道小题：按序号把横线切成等份，各划各的
+            wide = [ln for ln in lines
+                    if (y - 0.02) <= float(ln['y']) <= (y + 0.10)
+                    and re.search(r'lim|极限', ln.get('text') or '')]
+            if wide:
+                base = max(wide, key=lambda l: float(l['x1']) - float(l['x0']))
+            k, work_idx = work_idx, work_idx + 1
+            xa, xb = float(base['x0']), float(base['x1'])
+            n = max(1, work_total)
+            seg = {**base, 'x0': xa + (xb - xa) * k / n,
+                   'x1': xa + (xb - xa) * (k + 1) / n}
+            kind, tb = 'wave', _trace_under(gray, seg, frac=0.80)
+        elif kb is not None:
+            kind, tb = 'circle', kb
+        elif re.search(r'lim|极限', stem) or re.search(r'lim|极限', base.get('text') or ''):
+            kind, tb = 'wave', _trace_under(gray, base, frac=0.70)
+        elif (float(base['x1']) - float(base['x0'])) > 0.42:
+            # 长题干只划末尾一段，避免长横线压到下一行选项
+            seg = {**base, 'x0': float(base['x0']) + 0.62 * (float(base['x1']) - float(base['x0']))}
+            kind, tb = 'double', _trace_under(gray, seg, frac=1.0, height=0.0095)
+        else:
+            kind, tb = 'wave', _trace_under(gray, base, frac=0.62)
+        if tb[2] - tb[0] < 0.015 or tb[3] - tb[1] < 0.004:
+            continue
+        if kind != 'circle' and kind != 'tick' and (tb[2] - tb[0]) < 0.06:
+            continue
+        out.append({'q': it.get('q'), 'type': kind,
+                    'box': [round(max(0.0, min(1.0, v)), 4) for v in tb]})
+        # 第二道选择题顺手划掉一个错误选项，补齐“涂改”痕迹
+        if (not scribbled) and typ == 'choice' and choice_seen == 2 \
+                and re.fullmatch(r'[A-E]', ans):
+            wrong = _wrong_option_line(lines, ans, y)
+            if wrong is not None:
+                hh = min(0.009, max(0.007, float(wrong.get('h', 0.02)) * 0.45))
+                wx0 = max(0.05, float(wrong['x0']) + 0.002)
+                wx1 = float(wrong['x1']) - 0.002
+                if wx1 - wx0 < 0.08:
+                    wrong = None
+            if wrong is not None:
+                out.append({'q': it.get('q'), 'type': 'scribble',
+                            'box': [round(wx0, 4),
+                                    round(float(wrong['y']) - hh, 4),
+                                    round(wx1, 4),
+                                    round(float(wrong['y']) + hh, 4)]})
+                scribbled = True
+    seen, dedup = set(), []
+    for t in out:
+        key = (t['type'],) + tuple(t['box'])
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(t)
+    return _trim_traces(dedup, level)
+
+
 def _ocr_questions(gray):
     """没有视觉模型时，用本地 OCR 把卷面拆成题目（题号 / 题干 / 选项 / 类型）。"""
     lines = _ocr_lines(gray)
@@ -1127,17 +1426,21 @@ def _doc_font_path():
     return None
 
 
+def _enhance_gray(gray):
+    """去阴影、提白、增强：只用于 OCR，坐标与 scan.png 完全一致。"""
+    bg = cv2.GaussianBlur(gray, (0, 0), 25)
+    norm = cv2.divide(gray, bg, scale=255)
+    doc = cv2.convertScaleAbs(norm, alpha=1.28, beta=-42)
+    return cv2.medianBlur(doc, 3)
+
+
 def _make_document(gray, lines, items, out):
     """生成“扫描文档”：去阴影、提白、增强，不改任何位置。
 
     与 scan.png 同尺寸同坐标，所以版面与照片完全一致，
     后续答题框可以原样盖回，不会出现“重排后对不上”的问题。
     """
-    bg = cv2.GaussianBlur(gray, (0, 0), 25)
-    norm = cv2.divide(gray, bg, scale=255)
-    doc = cv2.convertScaleAbs(norm, alpha=1.28, beta=-42)
-    doc = cv2.medianBlur(doc, 3)
-    bgr = cv2.cvtColor(doc, cv2.COLOR_GRAY2BGR)
+    bgr = cv2.cvtColor(_enhance_gray(gray), cv2.COLOR_GRAY2BGR)
     cv2.imencode('.png', bgr)[1].tofile(str(out))
 
 
@@ -1159,6 +1462,8 @@ def _qnum_line(lines, qn, y):
         pat = re.compile(r'[（(]\s*%d\s*[)）]' % qn)
         cands = [ln for ln in lines
                  if pat.search(ln['text']) and abs(ln['y'] - y) <= 0.06]
+    # 题号会在每个大题里重复（1. / (1)），离当前题太远的不能要
+    cands = [ln for ln in cands if abs(float(ln['y']) - y) <= 0.09]
     return min(cands, key=lambda l: abs(l['y'] - y)) if cands else None
 
 
@@ -1329,19 +1634,181 @@ def _fallback_items(questions):
     return out
 
 
+def _right_ink_extent(gray, cy, x1, half=0.009, span=0.30):
+    """括号右侧还剩多少墨迹：答题括号后面基本没字，选项/公式括号后面还有正文。"""
+    H, W = gray.shape
+    y0 = max(0, int((cy - half) * H))
+    y1 = min(H, int((cy + half) * H))
+    xa = int(min(W - 2, (x1 + 0.003) * W))
+    xb = int(min(0.90 * W, xa + span * W))      # 右侧页边是暗的，不能算正文
+    if y1 - y0 < 4 or xb - xa < 8:
+        return 0.0
+    cols = (gray[y0:y1, xa:xb] < 118).sum(0)
+    idx = [i for i, c in enumerate(cols) if c >= 3]
+    return round((idx[-1] + xa) / W - x1, 4) if idx else 0.0
+
+
+def _answer_slots(gray):
+    """整页找“答题括号”：行尾、内部空白、右侧几乎没有正文。"""
+    H, W = gray.shape
+    raw = []
+    y = 0.05
+    while y <= 0.95:
+        for p in align._choice_pairs(gray, float(y), 0.012, 0.02):
+            if p['h'] * H < 15:
+                continue
+            if not (0.030 <= p['x1'] - p['x0'] <= 0.095):
+                continue
+            if p['x0'] < 0.12 or p['x1'] > 0.90:
+                continue
+            if _right_ink_extent(gray, p['cy'], p['x1']) > 0.05:
+                continue
+            raw.append(dict(p))
+        y += 0.004
+    raw.sort(key=lambda p: (p['cy'], p['x0']))
+    uniq = []
+    for p in raw:
+        merged = False
+        for q in uniq:
+            if abs(q['cy'] - p['cy']) > 0.006:
+                continue
+            ov = min(q['x1'], p['x1']) - max(q['x0'], p['x0'])
+            if ov >= 0.65 * min(q['x1'] - q['x0'], p['x1'] - p['x0']):
+                if (p['h'], -p['x0']) > (q['h'], -q['x0']):
+                    q.update(p)
+                merged = True
+                break
+        if not merged:
+            uniq.append(p)
+    return uniq
+
+
+def _choice_stem_y(q, lines, yh):
+    """找这道选择题题干行：模型给的 y 只是粗先验，题号行才靠得住。"""
+    try:
+        qn = int(str(q.get('q')).strip())
+    except (TypeError, ValueError):
+        qn = None
+    ln = _qnum_line(lines, qn, yh) if lines else None
+    if ln is not None:
+        return float(ln['y'])
+    cand = [l for l in (lines or [])
+            if not _OPT_RE.match(l.get('text') or '')
+            and abs(float(l['y']) - yh) <= 0.05]
+    if cand:
+        return float(min(cand, key=lambda l: abs(float(l['y']) - yh))['y'])
+    return yh
+
+
+def _assign_choice_slots(ch_q, pairs, lines=None):
+    """按题目顺序单调配括号：同一行取最右一对；没配到的题留空，交给兜底。"""
+    bands = []
+    for p in sorted(pairs, key=lambda t: t['cy']):
+        if bands and abs(bands[-1]['cy'] - p['cy']) <= 0.012:
+            if p['x0'] > bands[-1]['x0']:
+                bands[-1] = p
+        else:
+            bands.append(p)
+    picked, used, last = {}, set(), -1.0
+    for q in ch_q:
+        yh = _num(q.get('y'), 0.5)
+        sy = _choice_stem_y(q, lines, yh)
+        best = None
+        for i, p in enumerate(bands):
+            if i in used or p['cy'] <= last + 0.006:
+                continue
+            # 答题括号必须落在题干行上（允许倾斜），不能跑到选项行
+            if not (sy - 0.018 <= p['cy'] <= sy + 0.042):
+                continue
+            d = abs(p['cy'] - sy)
+            if best is None or d < best[0] - 1e-6 or (
+                    abs(d - best[0]) <= 0.008 and p['x0'] > bands[best[1]]['x0']):
+                best = (d, i)
+        if best:
+            p = bands[best[1]]
+            picked[id(q)] = p
+            used.add(best[1])
+            last = p['cy']
+    return picked
+
+
+def _blank_count(stem):
+    s = stem or ''
+    n = len(re.findall(r'_{2,}', s))
+    if n:
+        return n
+    return max(1, len(re.findall(r'[（(]\s*[)）]', s)))
+
+
+def _assign_fill_slots(fl_q, unders):
+    """按题目顺序单调配横线；一题多个空时取同一行相邻的几条。"""
+    picked, last = {}, -1.0
+    for q in fl_q:
+        yh = _num(q.get('y'), 0.5)
+        n = _blank_count(q.get('stem'))
+        cand = [u for u in unders
+                if u['cy'] > last + 0.006 and yh - 0.10 <= u['cy'] <= yh + 0.10]
+        cand.sort(key=lambda u: (abs(u['cy'] - yh), u['x0']))
+        if not cand:
+            continue
+        first = cand[0]
+        group = [u for u in cand if abs(u['cy'] - first['cy']) <= 0.014]
+        group.sort(key=lambda u: u['x0'])
+        group = group[:max(1, n)]
+        picked[id(q)] = group
+        last = max(u['cy'] for u in group)
+    return picked
+
+
+def _free_right(gray, y0, y1, x_start, x_stop):
+    """横线上方从 x_start 到 x_stop 是否是空白，返回可安全延伸到的 x。"""
+    if gray is None:
+        return x_stop
+    H, W = gray.shape
+    ya, yb = int(max(0, y0) * H), int(min(1, y1) * H)
+    xa, xb = int(max(0, x_start) * W), int(min(1, x_stop) * W)
+    if yb - ya < 4 or xb - xa < 4:
+        return x_start
+    cols = (gray[ya:yb, xa:xb] < 118).sum(0)
+    for i, c in enumerate(cols):
+        if c >= 2:
+            return max(x_start, (xa + i) / W - 0.004)
+    return x_stop
+
+
+def _extend_fill_box(gray, box, text):
+    """答案比横线长时向右借空白，避免字号被压成小字；借不到就保持原框。"""
+    if gray is None or not text:
+        return box
+    x0, y0, x1, y1 = [float(v) for v in box]
+    want = min(0.30, max(x1 - x0, 0.011 * len(text)))
+    if want <= x1 - x0 + 0.004:
+        return box
+    stop = _free_right(gray, y0, y1 - 0.010, x1, min(0.93, x0 + want))
+    if stop <= x1 + 0.004:
+        return box
+    return [x0, y0, round(stop, 4), y1]
+
+
 def _plan_items(questions, ch_rows, fl_rows, gray=None, ocr_lines=None):
     """把转写结果 + 版面检测合成“作答位置计划”，供第一轮确认。
 
-    位置以模型给的 x/y 为准；再在附近吸附真实括号/横线；检测不到才用模型原始点。
+    位置不依赖模型目测的 y：选择题找“行尾空白括号”，填空题找“答题横线”，
+    再按题目顺序单调配对；题干没有空档才退回“题号行下方写答案”。
     """
     ch_q = [q for q in questions if (q.get('type') or '').lower() == 'choice']
     fl_q = [q for q in questions if (q.get('type') or '').lower() in ('fill', 'fraction')]
-    if len(ch_rows) == len(ch_q) and ch_q:
-        ch_map = {id(q): ch_rows[i] for i, q in enumerate(ch_q)}
-    else:
-        ch_map = _match_rows(ch_q, ch_rows, 0.13, min_gap=0.020)
-    start = max([r['cy'] for r in ch_rows], default=None)
-    fl_map = _match_rows(fl_q, fl_rows, 0.16, start_cy=start, use_x=True, min_gap=0.028)
+    ch_slots, fl_slots = {}, {}
+    if gray is not None:
+        try:
+            ch_slots = _assign_choice_slots(ch_q, _answer_slots(gray), ocr_lines)
+        except Exception as e:
+            print(f'[plan] 括号定位失败：{e}')
+        try:
+            unds = [c for c in (fl_rows or []) if c['cy'] <= 0.95]
+            fl_slots = _assign_fill_slots(fl_q, unds)
+        except Exception as e:
+            print(f'[plan] 横线定位失败：{e}')
     items = []
     for q in questions:
         typ = (q.get('type') or 'fill').lower()
@@ -1357,44 +1824,72 @@ def _plan_items(questions, ch_rows, fl_rows, gray=None, ocr_lines=None):
             ay = _num(area.get('y'), min(0.94, y_hint + 0.03))
             aw = _num(area.get('w'), 0.86)
             ah = _num(area.get('h'), 0.20)
+            ah = min(ah, max(0.03, 0.97 - ay))      # 不能超出页面底部
             box = [round(ax, 4), round(ay, 4),
                    round(min(0.98, ax + aw), 4), round(min(0.97, ay + ah), 4)]
+            # 页面底部一行并列几道小题：只剩不到 6% 屏高，写整段过程必压下一题
+            compact = (box[3] - box[1]) < 0.06
             items.append({**q, 'y': box[1], 'x': box[0],
                           'w': round(box[2] - box[0], 4),
-                          'size': _num(area.get('size'), 30), 'box': box})
+                          'size': _num(area.get('size'), 30), 'box': box,
+                          'compact': compact})
             continue
-        row = None             # 密集教材页的括号行配对准度很差，不再使用检测行
-        box = None
         if typ == 'choice':
-            box = _ocr_choice_box(gray, y_hint, ocr_lines, qn) if ocr_lines else None
-            if box is None:
-                box = _snap_choice_box(gray, y_hint, x_hint)
-            if box is None:
-                box = _row_box(row, typ, None) if row else None
-            if box is None:
-                box = _line_end_box(gray, y_hint, typ)
-            if box is None:
-                cx = x_hint if x_hint is not None else 0.6
-                box = [round(cx - 0.025, 4), round(y_hint - 0.015, 4),
-                       round(cx + 0.025, 4), round(y_hint + 0.015, 4)]
+            slot = ch_slots.get(id(q))
+            if slot is not None:
+                box = [round(slot['x0'] - 0.006, 4), round(slot['cy'] - 0.014, 4),
+                       round(slot['x1'] + 0.006, 4), round(slot['cy'] + 0.014, 4)]
+            else:
+                ln = _qnum_line(ocr_lines, qn, y_hint) if ocr_lines else None
+                if ln is None and ocr_lines:
+                    ln = _question_line(ocr_lines, y_hint, None)
+                if ln is not None:
+                    yy = round(float(ln['y']) + 0.014, 4)
+                    box = [round(max(0.12, float(ln['x1']) - 0.10), 4), yy,
+                           round(min(0.95, float(ln['x1']) - 0.005), 4), round(yy + 0.030, 4)]
+                else:
+                    cx = x_hint if x_hint is not None else 0.6
+                    box = [round(cx - 0.03, 4), round(y_hint - 0.015, 4),
+                           round(cx + 0.03, 4), round(y_hint + 0.015, 4)]
         else:
-            box = _ocr_fill_box(gray, y_hint, ocr_lines, qn) if ocr_lines else None
-            if box is None:
-                box = _snap_fill_box(gray, y_hint, x_hint)
-            if box is None:
-                box = _row_box(row, typ, None) if row else None
-            if box is None:
-                box = _line_end_box(gray, y_hint, typ)
-            if box is None:
-                cx = x_hint if x_hint is not None else 0.6
-                box = [round(cx - 0.045, 4), round(y_hint - 0.022, 4),
-                       round(cx + 0.045, 4), round(y_hint + 0.008, 4)]
+            grp = fl_slots.get(id(q))
+            if grp:
+                blanks = [[round(u['x0'] - 0.006, 4), round(u['cy'] - 0.028, 4),
+                           round(u['x1'] + 0.006, 4), round(u['cy'] + 0.004, 4)]
+                          for u in grp]
+                box = [min(b[0] for b in blanks), min(b[1] for b in blanks),
+                       max(b[2] for b in blanks), max(b[3] for b in blanks)]
+                # 同一行多个空：合成一条长答案框，让整段答案连写（和人工一致）
+                if len(blanks) > 1 and max(b[0] for b in blanks) - min(b[2] for b in blanks) < 0.30:
+                    blanks = [box]
+            else:
+                box = None
+                ln = _qnum_line(ocr_lines, qn, y_hint) if ocr_lines else None
+                if ln is not None:
+                    yy = round(float(ln['y']) + 0.028, 4)
+                    box = [round(max(0.12, float(ln['x1']) - 0.12), 4), yy,
+                           round(min(0.95, float(ln['x1'])), 4), round(yy + 0.030, 4)]
+                if box is None:
+                    b = _snap_fill_box(gray, y_hint, x_hint) if gray is not None else None
+                    if b is None and gray is not None:
+                        b = _line_end_box(gray, y_hint, 'fill')
+                    if b is not None:
+                        box = b
+                    else:
+                        cx = x_hint if x_hint is not None else 0.6
+                        box = [round(cx - 0.045, 4), round(y_hint - 0.022, 4),
+                               round(cx + 0.045, 4), round(y_hint + 0.008, 4)]
+                blanks = [box]
+            box = [round(float(v), 4) for v in box]
+            y = round((box[1] + box[3]) / 2, 4)
+            x = round((box[0] + box[2]) / 2, 4)
+            items.append({**q, 'y': y, 'x': x, 'box': box,
+                          'blanks': blanks if len(blanks) > 1 else None})
+            continue
         y = round((box[1] + box[3]) / 2, 4)
         x = round((box[0] + box[2]) / 2, 4)
         items.append({**q, 'y': y, 'x': x, 'box': box})
     return items
-
-
 
 
 def _draw_plan(image, items, out_png):
@@ -1469,7 +1964,7 @@ def run_scan(image, task, workspace):
         questions = _sanitize(_normalize_types(data.get('questions') or []))
     else:
         print('[scan] 视觉模型不可用，改用本地 OCR 提取题目')
-        questions = _sanitize(_normalize_types(_ocr_questions(gray)))
+        questions = _sanitize(_normalize_types(_ocr_questions(_enhance_gray(gray))))
     _drop_bad_x(questions)
     if not questions:
         print('[scan] 没有识别到题目')
@@ -1482,7 +1977,7 @@ def run_scan(image, task, workspace):
         print(f'[scan] 版面检测失败，跳过：{e}')
         ch_rows, fl_rows = [], []
     try:
-        ocr_lines = _ocr_lines(gray)
+        ocr_lines = _ocr_lines(_enhance_gray(gray))
     except Exception as e:
         print(f'[scan] OCR 失败，跳过：{e}')
         ocr_lines = None
@@ -1536,7 +2031,15 @@ def run_scan(image, task, workspace):
     return 0
 
 
-def _commands_from_plan(items, solutions):
+def _split_answer(ans, n):
+    """一题多个空时按逗号/分号拆答案；拆不出对应份数就整段放在第一个空。"""
+    if n <= 1:
+        return [ans]
+    parts = [p.strip() for p in re.split(r'[，,；;]\s*', ans) if p.strip()]
+    return parts if len(parts) == n else [ans]
+
+
+def _commands_from_plan(items, solutions, gray=None):
     commands = []
     for i, it in enumerate(items):
         if it.get('skip'):
@@ -1545,8 +2048,14 @@ def _commands_from_plan(items, solutions):
         typ = (it.get('type') or 'fill').lower()
         q = it.get('q')
         if typ == 'work':
+            wbox = it.get('box') or []
+            if it.get('compact'):
+                continue
             lines = s.get('lines') or []
             lines = [_normalize_math(x) for x in lines if str(x).strip()]
+            # 教材页一行并列三道小题时，单题高度不足 5% 屏高，写整段过程必压下一题
+            if len(wbox) == 4 and (float(wbox[3]) - float(wbox[1])) < 0.05:
+                continue
             if not lines:
                 continue
             commands.append({'q': q, 'type': 'work',
@@ -1567,19 +2076,33 @@ def _commands_from_plan(items, solutions):
             ans = ans.replace('>=', '≥').replace('<=', '≤')
             if not ans:
                 continue
-            frac = _as_fraction(ans)
-            cmd = {'q': q, 'type': 'fraction', 'num': frac[0], 'den': frac[1],
-                   'y': float(it.get('y', 0.5))} if frac else \
-                  {'q': q, 'type': 'fill', 'text': ans, 'y': float(it.get('y', 0.5))}
-            if it.get('x') is not None:
-                cmd['x'] = float(it['x'])
-            if it.get('box'):
-                cmd['lock'] = [float(v) for v in it['box']]
-            commands.append(cmd)
+            blanks = it.get('blanks') or ([it['box']] if it.get('box') else [])
+            parts = _split_answer(ans, len(blanks)) if blanks else [ans]
+            if len(parts) != len(blanks):
+                blanks = [it.get('box')] if it.get('box') else []
+            for bi, part in enumerate(parts):
+                box = blanks[bi] if bi < len(blanks) else None
+                if box:
+                    box = _extend_fill_box(gray, box, part)
+                frac = _as_fraction(part)
+                cy = ((box[1] + box[3]) / 2) if box else float(it.get('y', 0.5))
+                cmd = {'q': q, 'type': 'fraction', 'num': frac[0], 'den': frac[1],
+                       'y': round(cy, 4)} if frac else \
+                      {'q': q, 'type': 'fill', 'text': part, 'y': round(cy, 4)}
+                if frac and box and (box[2] - box[0]) < 0.12:
+                    # 教材页行距密，分数不能按默认 50 号，否则会压到上一行
+                    cmd['size'] = 30
+                if box:
+                    cmd['lock'] = [float(v) for v in box]
+                elif it.get('x') is not None:
+                    cmd['x'] = float(it['x'])
+                if len(parts) > 1:
+                    cmd['q'] = q
+                commands.append(cmd)
     return {'style': 'pen', 'items': commands}
 
 
-def run_render(image, task, workspace, retries=2):
+def run_render(image, task, workspace, retries=2, trace='more'):
     """第二轮：严格按 plan.json 里确认过的位置解题、落笔。"""
     ws = Path(workspace).resolve()
     p = ws / 'plan.json'
@@ -1593,23 +2116,38 @@ def run_render(image, task, workspace, retries=2):
         print('[render] plan.json 不完整')
         return 1
     print(f'[render] 按确认位置作答：{len(items)} 题')
-    solutions = _solve(questions)
-    alt = _solve(questions, alt=True)
-    solutions = _reconcile(questions, solutions, alt)
-    solutions = _audit_bounds(questions, solutions)
-    solutions = _ensure_work(questions, solutions)
-    commands = _commands_from_plan(items, solutions)
-    if plan.get('profile'):
-        commands['profile'] = plan['profile']
-    if not commands['items']:
-        print('[render] 没有可落笔的答案')
-        return 1
     stem = Path(image).stem
     out_png = ws / f'{stem}_作答_API.png'
     calib = ws / f'{stem}_校准_API.png'
     render_img = ws / plan.get('scan', 'scan.png')
     if not render_img.exists():
         render_img = Path(image)
+    gray2 = None
+    try:
+        gray2 = cv2.imdecode(np.fromfile(str(render_img), dtype=np.uint8),
+                             cv2.IMREAD_GRAYSCALE)
+    except Exception:
+        gray2 = None
+    solutions = _solve(questions)
+    alt = _solve(questions, alt=True)
+    solutions = _reconcile(questions, solutions, alt)
+    solutions = _audit_bounds(questions, solutions)
+    solutions = _ensure_work(questions, solutions)
+    commands = _commands_from_plan(items, solutions, gray2)
+    if plan.get('profile'):
+        commands['profile'] = plan['profile']
+    trace_level = plan.get('trace') or trace or 'more'
+    if trace_level != 'none' and plan.get('traces', True):
+        try:
+            tr = _auto_traces(gray2, items, solutions, trace_level)
+            if tr:
+                commands['traces'] = tr
+                print(f'[render] 做题痕迹：{len(tr)} 条（{trace_level}）')
+        except Exception as e:
+            print(f'[render] 做题痕迹生成失败：{type(e).__name__}: {e}')
+    if not commands['items']:
+        print('[render] 没有可落笔的答案')
+        return 1
     last_rep = []
     for attempt in range(retries + 1):
         r, rep = _render(render_img, ws, commands, out_png, calib, no_align=True)
@@ -1684,12 +2222,13 @@ def _write_layout(ws, render_img, commands, report):
                       'size': (rep or {}).get('size') or cmd.get('size'),
                       'text': cmd.get('text'), 'num': cmd.get('num'),
                       'den': cmd.get('den'), 'lines': cmd.get('lines')})
-    data = {'size': [W, H], 'style': commands.get('style', 'pen'), 'items': items}
+    data = {'size': [W, H], 'style': commands.get('style', 'pen'), 'items': items,
+            'traces': commands.get('traces') or []}
     (Path(ws) / 'layout.json').write_text(
         json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
 
 
-def run_compose(image, task, workspace):
+def run_compose(image, task, workspace, trace='more'):
     """定稿：只按网页上确认过的布局重新落笔，不调用任何模型。"""
     ws = Path(workspace).resolve()
     lp = ws / 'layout.json'
@@ -1731,6 +2270,10 @@ def run_compose(image, task, workspace):
     commands = {'style': layout.get('style', 'pen'), 'items': cmds}
     if layout.get('profile'):
         commands['profile'] = layout['profile']
+    if layout.get('traces'):
+        tr = _trim_traces(layout['traces'], trace)
+        if tr:
+            commands['traces'] = tr
     base = ws / 'scan.png'
     if not base.exists():
         base = Path(image)
@@ -1859,6 +2402,8 @@ def main():
                     help='fast=一次转写+一次解题+落笔（默认）；free=旧的多步工具循环')
     ap.add_argument('--stage', choices=('full', 'scan', 'render', 'compose'), default='full',
                     help='scan=只扫描定位；render=按 plan.json 落笔；compose=按 layout.json 定稿')
+    ap.add_argument('--trace', choices=('none', 'less', 'more'), default='more',
+                    help='做题痕迹：none=无，less=少，more=多（默认）')
     ap.add_argument('--dry-run', action='store_true')
     a = ap.parse_args()
     ws = Path(a.workspace).resolve()
@@ -1868,12 +2413,12 @@ def main():
     if a.stage == 'scan':
         return run_scan(a.image, a.task, ws)
     if a.stage == 'render':
-        return run_render(a.image, a.task, ws)
+        return run_render(a.image, a.task, ws, trace=a.trace)
     if a.stage == 'compose':
-        return run_compose(a.image, a.task, ws)
+        return run_compose(a.image, a.task, ws, trace=a.trace)
     if a.mode == 'free':
         return run_agent(a.image, a.task, ws, a.max_steps)
-    return run_fast(a.image, a.task, ws)
+    return run_fast(a.image, a.task, ws, trace=a.trace)
 
 
 if __name__ == '__main__':
